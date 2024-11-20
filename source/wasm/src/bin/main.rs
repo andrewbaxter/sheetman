@@ -12,24 +12,20 @@ use {
             EventListenerOptions,
             EventListenerPhase,
         },
-        timers::callback::Timeout,
         utils::{
             document,
             window,
         },
     },
     js_sys::Array,
-    lunk::{
-        link,
-        EventGraph,
-        Prim,
-        ProcessingContext,
-    },
     rooting::{
         el,
+        scope_any,
         set_root,
         El,
         ResizeObserver,
+        ScopeValue,
+        WeakEl,
     },
     serde::{
         Deserialize,
@@ -37,10 +33,6 @@ use {
     },
     serde_json::Number,
     std::{
-        borrow::{
-            Borrow,
-            BorrowMut,
-        },
         cell::{
             Cell,
             OnceCell,
@@ -51,7 +43,11 @@ use {
             BTreeSet,
             HashMap,
         },
-        rc::Rc,
+        mem::swap,
+        rc::{
+            Rc,
+            Weak,
+        },
         str::FromStr,
     },
     wasm_bindgen::{
@@ -124,6 +120,52 @@ static ATTR_CONTENTEDITABLE: &str = "contenteditable";
 static ATTR_CONTENTEDITABLE_PLAINTEXT: &str = "plaintext-only";
 static ATTR_TABINDEX: &str = "tabindex";
 
+struct ObsBool_ {
+    value: bool,
+    cbs: Vec<Weak<RefCell<Box<dyn FnMut(bool)>>>>,
+}
+
+#[derive(Clone)]
+struct ObsBool(Rc<RefCell<ObsBool_>>);
+
+impl ObsBool {
+    fn new(initial: bool) -> Self {
+        return Self(Rc::new(RefCell::new(ObsBool_ {
+            value: initial,
+            cbs: vec![],
+        })));
+    }
+
+    fn get(&self) -> bool {
+        return self.0.as_ref().borrow().value;
+    }
+
+    fn set(&self, v: bool) {
+        let mut s = self.0.as_ref().borrow_mut();
+        if v == s.value {
+            return;
+        }
+        s.value = v;
+        let mut cbs = vec![];
+        swap(&mut cbs, &mut s.cbs);
+        for cb in cbs {
+            let Some(cb) = cb.upgrade() else {
+                console::log_1(&JsValue::from(format!("obs bool set; skipping dead cb")));
+                continue;
+            };
+            (*cb.as_ref().borrow_mut())(v);
+            s.cbs.push(Rc::downgrade(&cb));
+        }
+    }
+
+    fn listen(&self, mut cb: impl FnMut(bool) + 'static) -> ScopeValue {
+        cb(self.0.as_ref().borrow().value);
+        let cb = Rc::new(RefCell::new(Box::new(cb) as Box<dyn FnMut(bool)>));
+        self.0.as_ref().borrow_mut().cbs.push(Rc::downgrade(&cb));
+        return scope_any(cb);
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 enum ValueType {
     String,
@@ -134,10 +176,10 @@ enum ValueType {
     Missing,
 }
 
-#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Add, Sub)]
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Add, Sub, Debug)]
 struct X(i64);
 
-#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Add, Sub)]
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Add, Sub, Debug)]
 struct Y(i64);
 
 type Coord2 = (X, Y);
@@ -238,12 +280,6 @@ fn v_str(v: impl AsRef<str>) -> Value {
 }
 
 #[derive(Clone)]
-struct SpliceColumn {
-    title: String,
-    cells: Vec<Value>,
-}
-
-#[derive(Clone)]
 struct ChangeCells {
     cells: HashMap<Coord2, Value>,
 }
@@ -253,7 +289,7 @@ struct ChangeSplice {
     start: Coord2,
     remove: Coord2,
     /// Each element is a column, with entries for all rows not including added rows
-    add_columns: Vec<SpliceColumn>,
+    add_columns: Vec<Vec<Value>>,
     /// Each element is a row, with entries for all columns including added columns
     add_rows: Vec<Vec<Value>>,
 }
@@ -271,66 +307,50 @@ struct ChangeLevel {
 }
 
 struct State {
-    root: El,
-    table_thr: El,
-    edit_clock: RefCell<usize>,
-    edit_clock_ticker: RefCell<Option<Timeout>>,
+    root: WeakEl,
+    table_thr: WeakEl,
     undo: RefCell<Vec<ChangeLevel>>,
     redo: RefCell<Vec<ChangeLevel>>,
     last_change: Cell<Instant>,
     current_undo_level: RefCell<ChangeLevel>,
-    always: Prim<bool>,
-    selected: RefCell<Option<(usize, Element)>>,
-    selected_th_or_cell: Prim<bool>,
-    selected_cell: Prim<bool>,
-    selected_col_unpinned: Prim<bool>,
-    selected_row_unpinned: Prim<bool>,
-    has_undo: Prim<bool>,
-    has_redo: Prim<bool>,
+    always: ObsBool,
+    selected: RefCell<Option<Element>>,
+    selected_th_or_cell: ObsBool,
+    selected_cell: ObsBool,
+    selected_col_unpinned: ObsBool,
+    selected_row_unpinned: ObsBool,
+    has_undo: ObsBool,
+    has_redo: ObsBool,
     pin_resize_observer: OnceCell<ResizeObserver>,
 }
 
-fn edit_tick(state: &Rc<State>) -> usize {
-    console::log_1(&JsValue::from(format!("edit_tick start; {}", *state.edit_clock.borrow())));
-    let mut gt = state.edit_clock_ticker.borrow_mut();
-    if gt.is_none() {
-        *gt = Some(Timeout::new(500, {
-            let state = state.clone();
-            move || {
-                *state.edit_clock.borrow_mut() += 1;
-                console::log_1(&JsValue::from(format!("edit_tick tick cb; {}", *state.edit_clock.borrow())));
-                *state.edit_clock_ticker.borrow_mut() = None;
-            }
-        }));
-    }
-    return *state.edit_clock.borrow();
-}
-
-fn flush_undo(pc: &mut ProcessingContext, state: &State) {
+fn flush_undo(state: &State) {
     let mut current_undo_level = state.current_undo_level.borrow_mut();
     if current_undo_level.changes.is_empty() {
         return;
     }
     state.undo.borrow_mut().push(current_undo_level.clone());
     current_undo_level.changes.clear();
-    state.has_undo.set(pc, true);
+    state.has_undo.set(true);
 }
 
-fn push_undo_no_merge(pc: &mut ProcessingContext, state: &State, sel: Option<Coord2>, change: Change) {
+fn push_undo_no_merge(state: &State, sel: Option<Coord2>, change: Change) {
     let mut current_undo_level = state.current_undo_level.borrow_mut();
     if current_undo_level.changes.is_empty() {
         current_undo_level.selection = sel;
     }
     current_undo_level.changes.push(change);
-    state.has_undo.set(pc, true);
+    state.has_undo.set(true);
     state.redo.borrow_mut().clear();
-    state.has_redo.set(pc, false);
+    state.has_redo.set(false);
 }
 
-fn push_undo(pc: &mut ProcessingContext, state: &State, sel: Option<Coord2>, change: Change) {
-    if Instant::now().saturating_duration_since(state.last_change.get()) > Duration::from_millis(200) {
-        flush_undo(pc, state);
+fn push_undo(state: &State, sel: Option<Coord2>, change: Change) {
+    let now = Instant::now();
+    if now.saturating_duration_since(state.last_change.get()) > Duration::from_millis(1000) {
+        flush_undo(state);
     }
+    state.last_change.set(now);
     let mut current_undo_level = state.current_undo_level.borrow_mut();
     shed!{
         let Some(last_change) = current_undo_level.changes.last_mut() else {
@@ -342,13 +362,17 @@ fn push_undo(pc: &mut ProcessingContext, state: &State, sel: Option<Coord2>, cha
         let Change::Cells(change) = change else {
             break;
         };
-        last_change.cells.extend(change.cells.into_iter());
+        for (xy, val) in change.cells {
+            if !last_change.cells.contains_key(&xy) {
+                last_change.cells.insert(xy, val);
+            }
+        }
         state.redo.borrow_mut().clear();
-        state.has_redo.set(pc, false);
+        state.has_redo.set(false);
         return;
     }
     drop(current_undo_level);
-    push_undo_no_merge(pc, state, sel, change);
+    push_undo_no_merge(state, sel, change);
 }
 
 fn validate_cell(cell: &Element, v: &Value) {
@@ -392,11 +416,10 @@ fn apply_cell_value(cell: &Element, new_value: &Value) {
     validate_cell(cell, &new_value);
 }
 
-fn build_th(title: &str) -> Element {
+fn build_th(title: &Value) -> Element {
     let out = document().create_element("th").unwrap();
     out.set_attribute(ATTR_TABINDEX, "0").unwrap();
-    out.set_text_content(Some(&title));
-    apply_cell_value(&out, &v_str(title));
+    apply_cell_value(&out, title);
     return out;
 }
 
@@ -450,15 +473,29 @@ fn apply(state: &Rc<State>, change: Change) -> (Option<Coord2>, Change) {
             return (None, Change::Cells(ChangeCells { cells: out }));
         },
         Change::Splice(change) => {
-            let parent = state.table_thr.raw().parent_element().unwrap();
-            let children = parent.children();
+            let rows_parent = state.table_thr.upgrade().unwrap().raw().parent_element().unwrap();
+            let rows = rows_parent.children();
             let rev_change_remove = (X(change.add_columns.len() as i64), Y(change.add_rows.len() as i64));
             let old_selection = find_selection(state).map(|s| s.0);
+            let initial_column_count = column_count(state);
+            let initial_row_count = Y(rows.length() as i64);
+            console::log_1(
+                &JsValue::from(
+                    format!(
+                        "--- Splice; start {:?}, remove {:?}, add cols {}, add rows {}",
+                        change.start,
+                        change.remove,
+                        change.add_columns.len(),
+                        change.add_rows.len()
+                    ),
+                ),
+            );
 
             // Remove rows
             let mut rev_add_rows = vec![];
             for _ in change.start.1.0 .. change.remove.1.0 {
-                let row = children.item(change.start.1.0 as u32 + 1).unwrap();
+                let row = rows.item(change.start.1.0 as u32).unwrap();
+                console::log_1(&JsValue::from(format!("remove row at {}", change.start.1.0)));
                 let row_children = row.children();
                 let mut rev_add_row = vec![];
                 for i in 0 .. row_children.length() {
@@ -468,55 +505,51 @@ fn apply(state: &Rc<State>, change: Change) -> (Option<Coord2>, Change) {
                 rev_add_rows.push(rev_add_row);
             }
 
-            // Remove column headers
-            let thr_children = state.table_thr.raw().children();
-            let mut rev_add_columns = vec![];
-            for i in 0 .. change.remove.0.0 {
-                rev_add_columns.push(SpliceColumn {
-                    title: thr_children.item(i as u32).unwrap().text_content().unwrap(),
-                    cells: vec![],
-                });
-                thr_children.item(i as u32).unwrap().remove();
-            }
-
-            // Add column headers
-            let add_th_before = thr_children.item(change.start.0.0 as u32).map(|v| v.dyn_into::<Node>().unwrap());
-            for col in &change.add_columns {
-                state.table_thr.raw().insert_before(&build_th(&col.title), add_th_before.as_ref()).unwrap();
-            }
-
             // .
-            for (y, row) in get_rows(state).into_iter().enumerate() {
-                let row_children = row.children();
+            let mut rev_add_columns = vec![];
+            for _ in 0 .. change.remove.0.0 {
+                rev_add_columns.push(vec![]);
+            }
+            for y in 0 .. rows.length() {
+                let row = rows.item(y).unwrap();
+                let cells = row.children();
 
                 // Remove columns
-                for i in change.start.0.0 .. change.remove.0.0 {
-                    let cell = row_children.item(change.start.0.0 as u32).unwrap();
-                    rev_add_columns.get_mut(i as usize).unwrap().cells.push(get_value(&cell));
+                for i in 0 .. change.remove.0.0 {
+                    let cell = cells.item(change.start.0.0 as u32).unwrap();
+                    rev_add_columns.get_mut(i as usize).unwrap().push(get_value(&cell));
                     cell.remove();
+                    console::log_1(&JsValue::from(format!("remove col cell at y {} i {}", y, i)));
                 }
 
                 // Add new columns
-                let add_cells_before = row_children.item(change.start.0.0 as u32).map(|v| v.dyn_into::<Node>().unwrap());
-                for col in &change.add_columns {
-                    let row_value = col.cells.get(y).unwrap();
+                let add_cells_before = cells.item(change.start.0.0 as u32).map(|v| v.dyn_into::<Node>().unwrap());
+                for col_values in &change.add_columns {
+                    let cell_value = col_values.get(y as usize).unwrap();
+                    let cell;
+                    if y == 0 {
+                        cell = build_th(&cell_value);
+                    } else {
+                        cell = build_cell(&cell_value);
+                    }
                     row
                         .insert_before(
-                            &build_cell(&row_value),
+                            &cell,
                             add_cells_before.clone().map(|v| v.dyn_into::<Node>().unwrap()).as_ref(),
                         )
                         .unwrap();
+                    console::log_1(&JsValue::from(format!("add col cell")));
                 }
             }
 
             // Add rows
-            let add_rows_before = children.item(change.start.1.0 as u32 + 1).map(|r| r.dyn_into::<Node>().unwrap());
+            let add_rows_before = rows.item(change.start.1.0 as u32 + 1).map(|r| r.dyn_into::<Node>().unwrap());
             for row_values in change.add_rows {
                 let new_row = document().create_element("tr").unwrap();
                 for cell_value in row_values {
                     new_row.append_child(&build_cell(&cell_value)).unwrap();
                 }
-                parent.insert_before(&new_row, add_rows_before.as_ref()).unwrap();
+                rows_parent.insert_before(&new_row, add_rows_before.as_ref()).unwrap();
             }
 
             // Adjust selection
@@ -526,21 +559,21 @@ fn apply(state: &Rc<State>, change: Change) -> (Option<Coord2>, Change) {
                 if old_x < change.start.0 {
                     new_x = old_x;
                 } else {
-                    new_x = if change.start.0 == column_count(state) {
-                        change.start.0 - X(1)
+                    if change.start.0 == initial_column_count {
+                        new_x = change.start.0 - X(1);
                     } else {
-                        change.start.0
-                    };
+                        new_x = change.start.0;
+                    }
                 }
                 let new_y;
                 if old_y < change.start.1 {
                     new_y = old_y;
                 } else {
-                    new_y = if change.start.1 == row_count(state) {
-                        change.start.1 - Y(1)
+                    if change.start.1 == initial_row_count {
+                        new_y = change.start.1 - Y(1);
                     } else {
-                        change.start.1
-                    };
+                        new_y = change.start.1;
+                    }
                 }
                 let new_selection1 = (new_x, new_y);
                 if new_selection1 != (old_x, old_y) {
@@ -564,97 +597,100 @@ fn apply(state: &Rc<State>, change: Change) -> (Option<Coord2>, Change) {
 }
 
 fn select(state: &Rc<State>, new_sel: Coord2) {
-    get_cell(state, new_sel).unwrap().dyn_into::<HtmlElement>().unwrap().focus().unwrap();
+    let cell = get_cell(state, new_sel).unwrap().dyn_into::<HtmlElement>().unwrap();
+    cell.focus().unwrap();
+    register_select(state, &cell);
 }
 
 fn column_count(state: &State) -> X {
-    return X(state.table_thr.raw().children().length() as i64);
+    return X(state.table_thr.upgrade().unwrap().raw().children().length() as i64);
 }
 
 fn row_count(state: &State) -> Y {
-    return Y(state.table_thr.raw().parent_element().unwrap().children().length() as i64 - 1);
+    return Y(state.table_thr.upgrade().unwrap().raw().parent_element().unwrap().children().length() as i64 - 1);
 }
 
-fn el_toolbar_tab_button(
-    pc: &mut ProcessingContext,
-    title: impl AsRef<str>,
-    mut cb: impl FnMut(&mut ProcessingContext, &El) + 'static,
-) -> El {
-    let eg = pc.eg();
+fn el_toolbar_tab_button(title: impl AsRef<str>, mut cb: impl FnMut(&El) + 'static) -> El {
     let out = el("button");
     out.ref_text(title.as_ref());
     out.ref_on("click", {
         let e = out.clone();
-        move |_| eg.event(|pc| {
-            cb(pc, &e);
-        })
+        move |_| {
+            cb(&e);
+        }
     });
     return out;
 }
 
-fn el_toolbar_button(
-    pc: &mut ProcessingContext,
-    text: impl AsRef<str>,
-    icon: &str,
-    enabled: &Prim<bool>,
-    mut cb: impl FnMut(&mut ProcessingContext, &El) + 'static,
-) -> El {
+fn el_toolbar_button(text: impl AsRef<str>, icon: &str, enabled: &ObsBool, mut cb: impl FnMut(&El) + 'static) -> El {
     let out = el("button");
     out.ref_text(text.as_ref());
     out.ref_classes(&[icon]);
     out.ref_on("click", {
-        let eg = pc.eg();
         let e = out.clone();
         let enabled = enabled.clone();
-        move |_| eg.event(|pc| {
-            if !*enabled.borrow() {
+        move |_| {
+            if !enabled.get() {
                 return;
             }
-            cb(pc, &e);
-        })
+            cb(&e);
+        }
     });
-    out.ref_own(|e| link!((_pc = pc), (enabled = enabled), (), (e = e.weak()) {
-        let e = e.upgrade()?;
-        e.ref_modify_classes(&[(CLASS_DISABLED, !*enabled.borrow())]);
+    out.ref_own(|e| enabled.listen({
+        let e = e.weak();
+        move |enabled| {
+            let Some(e) = e.upgrade() else {
+                return;
+            };
+            e.ref_modify_classes(&[(CLASS_DISABLED, !enabled)]);
+        }
     }));
     return out;
 }
 
 fn el_toolbar_button_2state(
-    pc: &mut ProcessingContext,
     // Text, css class; 0 = true, 1 = false state
     state_values: [(&'static str, &'static str); 2],
-    enabled: &Prim<bool>,
-    icon_state: &Prim<bool>,
-    mut cb: impl FnMut(&mut ProcessingContext, &El) + 'static,
+    enabled: &ObsBool,
+    icon_state: &ObsBool,
+    mut cb: impl FnMut(&El) + 'static,
 ) -> El {
     let out = el("button");
     out.ref_on("click", {
-        let eg = pc.eg();
         let e = out.clone();
         let enabled = enabled.clone();
-        move |_| eg.event(|pc| {
-            if !*enabled.borrow() {
+        move |_| {
+            if !enabled.get() {
                 return;
             }
-            cb(pc, &e);
-        })
-    });
-    out.ref_own(|e| link!((_pc = pc), (enabled = enabled), (), (e = e.weak()) {
-        let e = e.upgrade()?;
-        e.ref_modify_classes(&[(CLASS_DISABLED, !*enabled.borrow())]);
-    }));
-    out.ref_own(|e| link!((_pc = pc), (icon_state = icon_state), (), (e = e.weak(), state_values = state_values) {
-        let e = e.upgrade()?;
-        let index;
-        if *icon_state.borrow() {
-            index = 0;
-        } else {
-            index = 1;
+            cb(&e);
         }
-        let other_index = 1 - index;
-        e.ref_text(state_values[index].0);
-        e.ref_modify_classes(&[(state_values[index].1, true), (state_values[other_index].1, false)]);
+    });
+    out.ref_own(|e| enabled.listen({
+        let e = e.weak();
+        move |enabled| {
+            let Some(e) = e.upgrade() else {
+                return;
+            };
+            e.ref_modify_classes(&[(CLASS_DISABLED, !enabled)]);
+        }
+    }));
+    out.ref_own(|e| icon_state.listen({
+        let e = e.weak();
+        move |icon_state| {
+            let Some(e) = e.upgrade() else {
+                return;
+            };
+            let index;
+            if icon_state {
+                index = 0;
+            } else {
+                index = 1;
+            }
+            let other_index = 1 - index;
+            e.ref_text(state_values[index].0);
+            e.ref_modify_classes(&[(state_values[index].1, true), (state_values[other_index].1, false)]);
+        }
     }));
     return out;
 }
@@ -710,7 +746,7 @@ fn update_row_pin_from(cell: &Element) {
 
 fn get_column(state: &State, col: X) -> Vec<Element> {
     let mut out = vec![];
-    let mut at = state.table_thr.raw();
+    let mut at = state.table_thr.upgrade().unwrap().raw();
     while let Some(row) = at.next_element_sibling() {
         out.push(row.children().item(col.0 as u32).unwrap());
         at = row;
@@ -720,7 +756,7 @@ fn get_column(state: &State, col: X) -> Vec<Element> {
 
 fn get_rows(state: &State) -> Vec<Element> {
     let mut out = vec![];
-    let mut at = state.table_thr.raw();
+    let mut at = state.table_thr.upgrade().unwrap().raw();
     while let Some(row) = at.next_element_sibling() {
         out.push(row.clone());
         at = row;
@@ -730,7 +766,18 @@ fn get_rows(state: &State) -> Vec<Element> {
 
 fn get_row(state: &State, row: Y) -> Vec<Element> {
     let mut out = vec![];
-    let row = state.table_thr.raw().parent_element().unwrap().children().item((row.0) as u32).unwrap().children();
+    let row =
+        state
+            .table_thr
+            .upgrade()
+            .unwrap()
+            .raw()
+            .parent_element()
+            .unwrap()
+            .children()
+            .item((row.0) as u32)
+            .unwrap()
+            .children();
     for i in 0 .. row.length() {
         out.push(row.item(i).unwrap());
     }
@@ -738,9 +785,10 @@ fn get_row(state: &State, row: Y) -> Vec<Element> {
 }
 
 fn get_cell(state: &State, coord2: Coord2) -> Option<Element> {
-    let Some(row) = state.table_thr.raw().parent_element().unwrap().children().item((coord2.1.0) as u32) else {
-        return None;
-    };
+    let Some(row) =
+        state.table_thr.upgrade().unwrap().raw().parent_element().unwrap().children().item((coord2.1.0) as u32) else {
+            return None;
+        };
     return row.children().item((coord2.0.0) as u32);
 }
 
@@ -754,7 +802,7 @@ fn index_in_parent(e: &Element) -> usize {
     panic!();
 }
 
-fn start_editing_cell(pc: &mut ProcessingContext, state: &Rc<State>, cell: &Element) {
+fn start_editing_cell(state: &Rc<State>, cell: &Element) {
     let v = get_value(cell);
     match v.type_ {
         ValueType::Bool => {
@@ -772,7 +820,7 @@ fn start_editing_cell(pc: &mut ProcessingContext, state: &Rc<State>, cell: &Elem
             if new_sel.is_some() {
                 panic!();
             }
-            push_undo(pc, state, Some(xy), rev_change);
+            push_undo(state, Some(xy), rev_change);
         },
         ValueType::String | ValueType::Number | ValueType::Json => {
             cell.set_attribute(ATTR_CONTENTEDITABLE, ATTR_CONTENTEDITABLE_PLAINTEXT).unwrap();
@@ -781,9 +829,16 @@ fn start_editing_cell(pc: &mut ProcessingContext, state: &Rc<State>, cell: &Elem
                 let sel = window().get_selection().unwrap().unwrap();
                 sel.remove_all_ranges().unwrap();
                 let range = document().create_range().unwrap();
-                let end = cell.text_content().unwrap().len();
-                range.set_start(cell, end as u32).unwrap();
-                range.set_end(cell, end as u32).unwrap();
+                let child_nodes = cell.child_nodes();
+                if child_nodes.length() == 0 {
+                    range.set_start(cell, 0).unwrap();
+                    range.set_end(cell, 0).unwrap();
+                } else {
+                    let text_node = child_nodes.item(0).unwrap();
+                    let end = text_node.text_content().unwrap().len() as u32;
+                    range.set_start(&text_node, end as u32).unwrap();
+                    range.set_end(&text_node, end as u32).unwrap();
+                }
                 sel.add_range(&range).unwrap();
             }
         },
@@ -798,7 +853,8 @@ fn stop_editing_cell(cell: &Element) {
 }
 
 fn replace_toolbar_tab_front(state: &Rc<State>, button: &El) {
-    let old_tab_buttons = state.root.raw().get_elements_by_class_name(CLASS_TOOLBAR_TAB_BUTTON_FRONT);
+    let old_tab_buttons =
+        state.root.upgrade().unwrap().raw().get_elements_by_class_name(CLASS_TOOLBAR_TAB_BUTTON_FRONT);
     for i in 0 .. old_tab_buttons.length() {
         old_tab_buttons.item(i).unwrap().class_list().remove_1(CLASS_TOOLBAR_TAB_BUTTON_FRONT).unwrap();
     }
@@ -810,52 +866,54 @@ fn get_xy(cell: &Element) -> Coord2 {
 }
 
 fn find_selection(state: &Rc<State>) -> Option<(Coord2, Element)> {
-    let selected = state.table_thr.raw().parent_element().unwrap().get_elements_by_class_name(CLASS_SELECTED);
+    let selected =
+        state
+            .table_thr
+            .upgrade()
+            .unwrap()
+            .raw()
+            .parent_element()
+            .unwrap()
+            .get_elements_by_class_name(CLASS_SELECTED);
     let Some(cell) = selected.item(0) else {
         return None;
     };
     return Some((get_xy(&cell), cell));
 }
 
-fn act_add_left(pc: &mut ProcessingContext, state: &Rc<State>) {
+fn act_add_left(state: &Rc<State>) {
     let Some((sel_xy, _)) = find_selection(state) else {
         return;
     };
     let change = Change::Splice(ChangeSplice {
         start: (sel_xy.0, Y(0)),
         remove: (X(0), Y(0)),
-        add_columns: vec![SpliceColumn {
-            title: "".to_string(),
-            cells: (0 .. row_count(&state).0).map(|_| v_str("")).collect(),
-        }],
+        add_columns: vec![(0 .. 1 + row_count(&state).0).map(|_| v_str("")).collect()],
         add_rows: vec![],
     });
-    flush_undo(pc, &state);
-    push_undo(pc, &state, Some(sel_xy), apply(&state, change).1);
-    flush_undo(pc, &state);
-    select(&state, (sel_xy.0 - X(1), sel_xy.1));
+    flush_undo(&state);
+    push_undo(&state, Some(sel_xy), apply(&state, change).1);
+    flush_undo(&state);
+    select(&state, sel_xy);
 }
 
-fn act_add_right(pc: &mut ProcessingContext, state: &Rc<State>) {
+fn act_add_right(state: &Rc<State>) {
     let Some((sel_xy, _)) = find_selection(state) else {
         return;
     };
     let change = Change::Splice(ChangeSplice {
         start: (sel_xy.0 + X(1), Y(0)),
         remove: (X(0), Y(0)),
-        add_columns: vec![SpliceColumn {
-            title: "".to_string(),
-            cells: (0 .. row_count(&state).0).map(|_| v_str("")).collect(),
-        }],
+        add_columns: vec![(0 .. 1 + row_count(&state).0).map(|_| v_str("")).collect()],
         add_rows: vec![],
     });
-    flush_undo(pc, &state);
-    push_undo(pc, &state, Some(sel_xy), apply(&state, change).1);
-    flush_undo(pc, &state);
+    flush_undo(&state);
+    push_undo(&state, Some(sel_xy), apply(&state, change).1);
+    flush_undo(&state);
     select(&state, (sel_xy.0 + X(1), sel_xy.1));
 }
 
-fn act_add_up(pc: &mut ProcessingContext, state: &Rc<State>) {
+fn act_add_up(state: &Rc<State>) {
     let Some((sel_xy, _)) = find_selection(state) else {
         return;
     };
@@ -872,13 +930,13 @@ fn act_add_up(pc: &mut ProcessingContext, state: &Rc<State>) {
             string: "".to_string(),
         }).collect()],
     });
-    flush_undo(pc, &state);
-    push_undo(pc, &state, Some(sel_xy), apply(&state, change).1);
-    flush_undo(pc, &state);
+    flush_undo(&state);
+    push_undo(&state, Some(sel_xy), apply(&state, change).1);
+    flush_undo(&state);
     select(&state, sel_xy);
 }
 
-fn act_add_down(pc: &mut ProcessingContext, state: &Rc<State>) {
+fn act_add_down(state: &Rc<State>) {
     let Some((sel_xy, _)) = find_selection(state) else {
         return;
     };
@@ -895,15 +953,16 @@ fn act_add_down(pc: &mut ProcessingContext, state: &Rc<State>) {
             string: "".to_string(),
         }).collect()],
     });
-    flush_undo(pc, &state);
-    push_undo(pc, &state, Some(sel_xy), apply(&state, change).1);
-    flush_undo(pc, &state);
+    flush_undo(&state);
+    push_undo(&state, Some(sel_xy), apply(&state, change).1);
+    flush_undo(&state);
     select(&state, (sel_xy.0, sel_xy.1 + Y(1)));
 }
 
-fn act_undo(pc: &mut ProcessingContext, state: &Rc<State>) {
-    flush_undo(pc, &state);
-    if let Some(mut level) = state.undo.borrow_mut().pop() {
+fn act_undo(state: &Rc<State>) {
+    flush_undo(&state);
+    let level = state.undo.borrow_mut().pop();
+    if let Some(mut level) = level {
         let mut rev_level = ChangeLevel {
             selection: find_selection(state).map(|s| s.0),
             changes: vec![],
@@ -915,9 +974,9 @@ fn act_undo(pc: &mut ProcessingContext, state: &Rc<State>) {
             last_apply_sel = apply_sel;
         }
         state.redo.borrow_mut().push(rev_level);
-        state.has_redo.set(pc, true);
+        state.has_redo.set(true);
         if state.undo.borrow().is_empty() {
-            state.has_undo.set(pc, false);
+            state.has_undo.set(false);
         }
         if let Some(sel) = level.selection.or(last_apply_sel) {
             select(&state, sel);
@@ -925,9 +984,10 @@ fn act_undo(pc: &mut ProcessingContext, state: &Rc<State>) {
     }
 }
 
-fn act_redo(pc: &mut ProcessingContext, state: &Rc<State>) {
-    flush_undo(pc, &state);
-    if let Some(mut level) = state.redo.borrow_mut().pop() {
+fn act_redo(state: &Rc<State>) {
+    flush_undo(&state);
+    let level = state.redo.borrow_mut().pop();
+    if let Some(mut level) = level {
         let mut rev_level = ChangeLevel {
             selection: find_selection(state).map(|s| s.0),
             changes: vec![],
@@ -939,117 +999,109 @@ fn act_redo(pc: &mut ProcessingContext, state: &Rc<State>) {
             last_apply_sel = apply_sel;
         }
         state.undo.borrow_mut().push(rev_level);
+        state.has_undo.set(true);
         if let Some(sel) = level.selection.or(last_apply_sel) {
             select(&state, sel);
         }
     }
 }
 
-fn build_toolbar_sheet(pc: &mut ProcessingContext, state: &Rc<State>, button: &El, toolbar: &El) {
+fn build_toolbar_sheet(state: &Rc<State>, button: &El, toolbar: &El) {
     replace_toolbar_tab_front(&state, &button);
     toolbar.ref_clear();
     toolbar.ref_extend(vec![
         //. .
-        el_toolbar_button(pc, "Clear", ICON_CLEAR, &state.always, {
+        el_toolbar_button("Clear", ICON_CLEAR, &state.always, {
             let state = state.clone();
-            move |pc, _| {
+            move |_| {
                 let (new_sel, rev_change) = apply(&state, Change::Splice(ChangeSplice {
                     start: (X(0), Y(0)),
-                    remove: (column_count(&state), row_count(&state) - Y(1)),
-                    add_columns: vec![SpliceColumn {
-                        title: "".to_string(),
-                        cells: vec![v_str("")],
-                    }],
+                    remove: (column_count(&state), row_count(&state)),
+                    add_columns: vec![vec![v_str(""), v_str("")]],
                     add_rows: vec![],
                 }));
-                push_undo(pc, &state, find_selection(&state).map(|s| s.0), rev_change);
+                push_undo(&state, find_selection(&state).map(|s| s.0), rev_change);
                 if let Some(new_sel) = new_sel {
                     select(&state, new_sel);
                 }
             }
         }),
-        el_toolbar_button(pc, "Undo", ICON_UNDO, &state.has_undo, {
+        el_toolbar_button("Undo", ICON_UNDO, &state.has_undo, {
             let state = state.clone();
-            move |pc, _| act_undo(pc, &state)
+            move |_| act_undo(&state)
         }),
-        el_toolbar_button(pc, "Redo", ICON_REDO, &state.has_redo, {
+        el_toolbar_button("Redo", ICON_REDO, &state.has_redo, {
             let state = state.clone();
-            move |pc, _| act_redo(pc, &state)
+            move |_| act_redo(&state)
         })
     ]);
 }
 
-fn build_toolbar_column(pc: &mut ProcessingContext, state: &Rc<State>, button: &El, toolbar: &El) {
+fn build_toolbar_column(state: &Rc<State>, button: &El, toolbar: &El) {
     replace_toolbar_tab_front(&state, &button);
     toolbar.ref_clear();
     toolbar.ref_extend(vec![
         //. .
-        el_toolbar_button_2state(
-            pc,
-            [("Pin", ICON_PIN), ("Unpin", ICON_UNPIN)],
-            &state.always,
-            &state.selected_col_unpinned,
-            {
-                let state = state.clone();
-                move |pc, e| {
-                    let Some((sel_xy, _)) = find_selection(&state) else {
-                        return;
-                    };
-                    let mut cells = get_column(&state, sel_xy.0).into_iter();
-                    let Some(first_cell) = cells.next() else {
-                        panic!();
-                    };
-                    let first_classes = first_cell.class_list();
-                    let unpinned = !first_classes.contains(CLASS_PIN_COL);
-                    if !unpinned {
-                        first_classes.remove_1(CLASS_PIN_COL).unwrap();
-                        state.pin_resize_observer.get().unwrap().0.js_resize_observer.unobserve(&first_cell);
-                        for cell in cells {
-                            cell.class_list().remove_1(CLASS_PIN_COL).unwrap();
-                            state.pin_resize_observer.get().unwrap().0.js_resize_observer.unobserve(&cell);
-                        }
-                        e.ref_text("Pin");
-                        e.ref_modify_classes(&[(CLASS_BUTTON_PIN, true), (CLASS_BUTTON_UNPIN, false)]);
-                    } else {
-                        first_classes.add_1(CLASS_PIN_COL).unwrap();
-                        let obs_opts = ResizeObserverOptions::new();
-                        obs_opts.set_box(ResizeObserverBoxOptions::BorderBox);
+        el_toolbar_button_2state([("Pin", ICON_PIN), ("Unpin", ICON_UNPIN)], &state.always, &state.selected_col_unpinned, {
+            let state = state.clone();
+            move |e| {
+                let Some((sel_xy, _)) = find_selection(&state) else {
+                    return;
+                };
+                let mut cells = get_column(&state, sel_xy.0).into_iter();
+                let Some(first_cell) = cells.next() else {
+                    panic!();
+                };
+                let first_classes = first_cell.class_list();
+                let unpinned = !first_classes.contains(CLASS_PIN_COL);
+                if !unpinned {
+                    first_classes.remove_1(CLASS_PIN_COL).unwrap();
+                    state.pin_resize_observer.get().unwrap().0.js_resize_observer.unobserve(&first_cell);
+                    for cell in cells {
+                        cell.class_list().remove_1(CLASS_PIN_COL).unwrap();
+                        state.pin_resize_observer.get().unwrap().0.js_resize_observer.unobserve(&cell);
+                    }
+                    e.ref_text("Pin");
+                    e.ref_modify_classes(&[(CLASS_BUTTON_PIN, true), (CLASS_BUTTON_UNPIN, false)]);
+                } else {
+                    first_classes.add_1(CLASS_PIN_COL).unwrap();
+                    let obs_opts = ResizeObserverOptions::new();
+                    obs_opts.set_box(ResizeObserverBoxOptions::BorderBox);
+                    state
+                        .pin_resize_observer
+                        .get()
+                        .unwrap()
+                        .0
+                        .js_resize_observer
+                        .observe_with_options(&first_cell, &obs_opts);
+                    for cell in cells {
+                        cell.class_list().add_1(CLASS_PIN_COL).unwrap();
                         state
                             .pin_resize_observer
                             .get()
                             .unwrap()
                             .0
                             .js_resize_observer
-                            .observe_with_options(&first_cell, &obs_opts);
-                        for cell in cells {
-                            cell.class_list().add_1(CLASS_PIN_COL).unwrap();
-                            state
-                                .pin_resize_observer
-                                .get()
-                                .unwrap()
-                                .0
-                                .js_resize_observer
-                                .observe_with_options(&cell, &obs_opts);
-                        }
-                        e.ref_text("Unpin");
-                        e.ref_modify_classes(&[(CLASS_BUTTON_PIN, false), (CLASS_BUTTON_UNPIN, true)]);
-                        update_column_pin_from(&state, &first_cell);
+                            .observe_with_options(&cell, &obs_opts);
                     }
-                    state.selected_col_unpinned.set(pc, unpinned);
+                    e.ref_text("Unpin");
+                    e.ref_modify_classes(&[(CLASS_BUTTON_PIN, false), (CLASS_BUTTON_UNPIN, true)]);
+                    update_column_pin_from(&state, &first_cell);
                 }
-            },
-        ),
-        el_toolbar_button(pc, "Add left", ICON_ADD_LEFT, &state.always, {
-            let state = state.clone();
-            move |pc, _| act_add_left(pc, &state)
+                state.selected_col_unpinned.set(unpinned);
+            }
         }),
-        el_toolbar_button(pc, "Add right", ICON_ADD_RIGHT, &state.always, {
+        el_toolbar_button("Add left", ICON_ADD_LEFT, &state.always, {
             let state = state.clone();
-            move |pc, _| act_add_right(pc, &state)
+            move |_| act_add_left(&state)
         }),
-        el_toolbar_button(pc, "Delete", ICON_DELETE, &state.always, {
+        el_toolbar_button("Add right", ICON_ADD_RIGHT, &state.always, {
             let state = state.clone();
-            move |pc, _| {
+            move |_| act_add_right(&state)
+        }),
+        el_toolbar_button("Delete", ICON_DELETE, &state.always, {
+            let state = state.clone();
+            move |_| {
                 let Some((sel_xy, _)) = find_selection(&state) else {
                     return;
                 };
@@ -1060,25 +1112,22 @@ fn build_toolbar_column(pc: &mut ProcessingContext, state: &Rc<State>, button: &
                     add_columns: if col_count > X(1) {
                         vec![]
                     } else {
-                        vec![SpliceColumn {
-                            title: "".to_string(),
-                            cells: (0 .. row_count(&state).0).map(|_| v_str("")).collect(),
-                        }]
+                        vec![(0 .. 1 + row_count(&state).0).map(|_| v_str("")).collect()]
                     },
                     add_rows: vec![],
                 });
                 let (new_sel, rev_change) = apply(&state, change);
-                flush_undo(pc, &state);
-                push_undo(pc, &state, Some(sel_xy), rev_change);
-                flush_undo(pc, &state);
+                flush_undo(&state);
+                push_undo(&state, Some(sel_xy), rev_change);
+                flush_undo(&state);
                 if let Some(new_sel) = new_sel {
                     select(&state, new_sel);
                 }
             }
         }),
-        el_toolbar_button(pc, "Sort", ICON_SORT, &state.always, {
+        el_toolbar_button("Sort", ICON_SORT, &state.always, {
             let state = state.clone();
-            move |pc, _| {
+            move |_| {
                 let Some((sel_xy, _)) = find_selection(&state) else {
                     return;
                 };
@@ -1100,14 +1149,14 @@ fn build_toolbar_column(pc: &mut ProcessingContext, state: &Rc<State>, button: &
                         change.cells.insert((X(row_idx as i64), Y(col_idx as i64)), cell);
                     }
                 }
-                flush_undo(pc, &state);
-                push_undo(pc, &state, Some(sel_xy), apply(&state, Change::Cells(change)).1);
-                flush_undo(pc, &state);
+                flush_undo(&state);
+                push_undo(&state, Some(sel_xy), apply(&state, Change::Cells(change)).1);
+                flush_undo(&state);
             }
         }),
-        el_toolbar_button(pc, "Sort reverse", ICON_SORT_REV, &state.always, {
+        el_toolbar_button("Sort reverse", ICON_SORT_REV, &state.always, {
             let state = state.clone();
-            move |pc, _| {
+            move |_| {
                 let Some((sel_xy, _)) = find_selection(&state) else {
                     return;
                 };
@@ -1129,27 +1178,26 @@ fn build_toolbar_column(pc: &mut ProcessingContext, state: &Rc<State>, button: &
                         change.cells.insert((X(row_idx as i64), Y(col_idx as i64)), cell);
                     }
                 }
-                flush_undo(pc, &state);
-                push_undo(pc, &state, Some(sel_xy), apply(&state, Change::Cells(change)).1);
-                flush_undo(pc, &state);
+                flush_undo(&state);
+                push_undo(&state, Some(sel_xy), apply(&state, Change::Cells(change)).1);
+                flush_undo(&state);
             }
         })
     ]);
 }
 
-fn build_toolbar_row(pc: &mut ProcessingContext, state: &Rc<State>, button: &El, toolbar: &El) {
+fn build_toolbar_row(state: &Rc<State>, button: &El, toolbar: &El) {
     replace_toolbar_tab_front(&state, &button);
     toolbar.ref_clear();
     toolbar.ref_extend(vec![
         //. .
         el_toolbar_button_2state(
-            pc,
             [("Pin", ICON_PIN), ("Unpin", ICON_UNPIN)],
             &state.selected_cell,
             &state.selected_row_unpinned,
             {
                 let state = state.clone();
-                move |pc, e| {
+                move |e| {
                     let Some((sel_xy, _)) = find_selection(&state) else {
                         return;
                     };
@@ -1193,21 +1241,21 @@ fn build_toolbar_row(pc: &mut ProcessingContext, state: &Rc<State>, button: &El,
                         e.ref_modify_classes(&[(CLASS_BUTTON_PIN, false), (CLASS_BUTTON_UNPIN, true)]);
                         update_row_pin_from(&first_cell);
                     }
-                    state.selected_col_unpinned.set(pc, unpinned);
+                    state.selected_col_unpinned.set(unpinned);
                 }
             },
         ),
-        el_toolbar_button(pc, "Add above", ICON_ADD_UP, &state.selected_cell, {
+        el_toolbar_button("Add above", ICON_ADD_UP, &state.selected_cell, {
             let state = state.clone();
-            move |pc, _| act_add_up(pc, &state)
+            move |_| act_add_up(&state)
         }),
-        el_toolbar_button(pc, "Add below", ICON_ADD_DOWN, &state.selected_cell, {
+        el_toolbar_button("Add below", ICON_ADD_DOWN, &state.selected_cell, {
             let state = state.clone();
-            move |pc, _| act_add_down(pc, &state)
+            move |_| act_add_down(&state)
         }),
-        el_toolbar_button(pc, "Delete", ICON_DELETE, &state.selected_cell, {
+        el_toolbar_button("Delete", ICON_DELETE, &state.selected_cell, {
             let state = state.clone();
-            move |pc, _| {
+            move |_| {
                 let Some((sel_xy, _)) = find_selection(&state) else {
                     return;
                 };
@@ -1218,24 +1266,24 @@ fn build_toolbar_row(pc: &mut ProcessingContext, state: &Rc<State>, button: &El,
                     add_rows: vec![],
                 });
                 let (new_sel, rev_change) = apply(&state, change);
-                flush_undo(pc, &state);
-                push_undo(pc, &state, Some(sel_xy), rev_change);
-                flush_undo(pc, &state);
+                flush_undo(&state);
+                push_undo(&state, Some(sel_xy), rev_change);
+                flush_undo(&state);
                 if let Some(new_sel) = new_sel {
                     select(&state, new_sel);
                 }
             }
         }),
-        el_toolbar_button(pc, "Shift up", ICON_SHIFT_UP, &state.selected_cell, {
+        el_toolbar_button("Shift up", ICON_SHIFT_UP, &state.selected_cell, {
             let state = state.clone();
-            move |pc, _| {
+            move |_| {
                 let Some((sel_xy, _)) = find_selection(&state) else {
                     return;
                 };
                 if sel_xy.1 <= Y(1) {
                     return;
                 }
-                flush_undo(pc, &state);
+                flush_undo(&state);
                 let change = Change::Splice(ChangeSplice {
                     start: (X(0), sel_xy.1),
                     remove: (X(0), Y(1)),
@@ -1246,28 +1294,28 @@ fn build_toolbar_row(pc: &mut ProcessingContext, state: &Rc<State>, button: &El,
                 let Change::Splice(rev_change_splice) = &rev_change else {
                     panic!();
                 };
-                push_undo_no_merge(pc, &state, Some(sel_xy), rev_change.clone());
+                push_undo_no_merge(&state, Some(sel_xy), rev_change.clone());
                 let rev_change = Change::Splice(ChangeSplice {
                     start: (X(0), sel_xy.1 - Y(1)),
                     remove: (X(0), Y(0)),
                     add_rows: rev_change_splice.add_rows.clone(),
                     add_columns: vec![],
                 });
-                push_undo_no_merge(pc, &state, Some(sel_xy), rev_change.clone());
-                flush_undo(pc, &state);
+                push_undo_no_merge(&state, Some(sel_xy), rev_change.clone());
+                flush_undo(&state);
                 select(&state, (sel_xy.0, sel_xy.1 - Y(1)));
             }
         }),
-        el_toolbar_button(pc, "Shift down", ICON_SHIFT_DOWN, &state.selected_cell, {
+        el_toolbar_button("Shift down", ICON_SHIFT_DOWN, &state.selected_cell, {
             let state = state.clone();
-            move |pc, _| {
+            move |_| {
                 let Some((sel_xy, _)) = find_selection(&state) else {
                     return;
                 };
                 if sel_xy.1 == row_count(&state) {
                     return;
                 }
-                flush_undo(pc, &state);
+                flush_undo(&state);
                 let change = Change::Splice(ChangeSplice {
                     start: (X(0), sel_xy.1),
                     remove: (X(0), Y(1)),
@@ -1278,29 +1326,29 @@ fn build_toolbar_row(pc: &mut ProcessingContext, state: &Rc<State>, button: &El,
                 let Change::Splice(rev_change_splice) = &rev_change else {
                     panic!();
                 };
-                push_undo_no_merge(pc, &state, Some(sel_xy), rev_change.clone());
+                push_undo_no_merge(&state, Some(sel_xy), rev_change.clone());
                 let rev_change = Change::Splice(ChangeSplice {
                     start: (X(0), sel_xy.1 + Y(1)),
                     remove: (X(0), Y(0)),
                     add_rows: rev_change_splice.add_rows.clone(),
                     add_columns: vec![],
                 });
-                push_undo_no_merge(pc, &state, Some(sel_xy), rev_change.clone());
-                flush_undo(pc, &state);
+                push_undo_no_merge(&state, Some(sel_xy), rev_change.clone());
+                flush_undo(&state);
                 select(&state, (sel_xy.0, sel_xy.1 + Y(1)));
             }
         })
     ]);
 }
 
-fn build_toolbar_cell(pc: &mut ProcessingContext, state: &Rc<State>, button: &El, toolbar: &El) {
+fn build_toolbar_cell(state: &Rc<State>, button: &El, toolbar: &El) {
     replace_toolbar_tab_front(&state, &button);
     toolbar.ref_clear();
     toolbar.ref_extend(vec![
         //. .
-        el_toolbar_button(pc, "String", ICON_TYPE_STRING, &state.selected_cell, {
+        el_toolbar_button("String", ICON_TYPE_STRING, &state.selected_cell, {
             let state = state.clone();
-            move |pc, _| {
+            move |_| {
                 let Some((sel_xy, sel)) = find_selection(&state) else {
                     return;
                 };
@@ -1333,12 +1381,12 @@ fn build_toolbar_cell(pc: &mut ProcessingContext, state: &Rc<State>, button: &El
                 if new_sel.is_some() {
                     panic!();
                 }
-                push_undo(pc, &state, Some(sel_xy), rev_change);
+                push_undo(&state, Some(sel_xy), rev_change);
             }
         }),
-        el_toolbar_button(pc, "Number", ICON_TYPE_NUMBER, &state.selected_cell, {
+        el_toolbar_button("Number", ICON_TYPE_NUMBER, &state.selected_cell, {
             let state = state.clone();
-            move |pc, _| {
+            move |_| {
                 let Some((sel_xy, sel)) = find_selection(&state) else {
                     return;
                 };
@@ -1377,12 +1425,12 @@ fn build_toolbar_cell(pc: &mut ProcessingContext, state: &Rc<State>, button: &El
                 if new_sel.is_some() {
                     panic!();
                 }
-                push_undo(pc, &state, Some(sel_xy), rev_change);
+                push_undo(&state, Some(sel_xy), rev_change);
             }
         }),
-        el_toolbar_button(pc, "Bool", ICON_TYPE_BOOL, &state.selected_cell, {
+        el_toolbar_button("Bool", ICON_TYPE_BOOL, &state.selected_cell, {
             let state = state.clone();
-            move |pc, _| {
+            move |_| {
                 let Some((sel_xy, sel)) = find_selection(&state) else {
                     return;
                 };
@@ -1421,12 +1469,12 @@ fn build_toolbar_cell(pc: &mut ProcessingContext, state: &Rc<State>, button: &El
                 if new_sel.is_some() {
                     panic!();
                 }
-                push_undo(pc, &state, Some(sel_xy), rev_change);
+                push_undo(&state, Some(sel_xy), rev_change);
             }
         }),
-        el_toolbar_button(pc, "Json", ICON_TYPE_JSON, &state.selected_cell, {
+        el_toolbar_button("Json", ICON_TYPE_JSON, &state.selected_cell, {
             let state = state.clone();
-            move |pc, _| {
+            move |_| {
                 let Some((sel_xy, sel)) = find_selection(&state) else {
                     return;
                 };
@@ -1449,12 +1497,12 @@ fn build_toolbar_cell(pc: &mut ProcessingContext, state: &Rc<State>, button: &El
                 if new_sel.is_some() {
                     panic!();
                 }
-                push_undo(pc, &state, Some(sel_xy), rev_change);
+                push_undo(&state, Some(sel_xy), rev_change);
             }
         }),
-        el_toolbar_button(pc, "Null", ICON_TYPE_NULL, &state.selected_cell, {
+        el_toolbar_button("Null", ICON_TYPE_NULL, &state.selected_cell, {
             let state = state.clone();
-            move |pc, _| {
+            move |_| {
                 let Some((sel_xy, _)) = find_selection(&state) else {
                     return;
                 };
@@ -1470,12 +1518,12 @@ fn build_toolbar_cell(pc: &mut ProcessingContext, state: &Rc<State>, button: &El
                 if new_sel.is_some() {
                     panic!();
                 }
-                push_undo(pc, &state, Some(sel_xy), rev_change);
+                push_undo(&state, Some(sel_xy), rev_change);
             }
         }),
-        el_toolbar_button(pc, "Missing", ICON_TYPE_MISSING, &state.selected_cell, {
+        el_toolbar_button("Missing", ICON_TYPE_MISSING, &state.selected_cell, {
             let state = state.clone();
-            move |pc, _| {
+            move |_| {
                 let Some((sel_xy, _)) = find_selection(&state) else {
                     return;
                 };
@@ -1491,10 +1539,46 @@ fn build_toolbar_cell(pc: &mut ProcessingContext, state: &Rc<State>, button: &El
                 if new_sel.is_some() {
                     panic!();
                 }
-                push_undo(pc, &state, Some(sel_xy), rev_change);
+                push_undo(&state, Some(sel_xy), rev_change);
             }
         })
     ]);
+}
+
+fn register_select(state: &Rc<State>, cell: &Element) {
+    let classes = cell.class_list();
+    if !classes.contains(CLASS_SELECTED) {
+        // Deselect old
+        let old_selected =
+            state
+                .table_thr
+                .upgrade()
+                .unwrap()
+                .raw()
+                .parent_element()
+                .unwrap()
+                .get_elements_by_class_name(CLASS_SELECTED);
+        for i in 0 .. old_selected.length() {
+            let cell = old_selected.item(i).unwrap();
+            cell.class_list().remove_1(CLASS_SELECTED).unwrap();
+            stop_editing_cell(&cell);
+        }
+
+        // Select new
+        classes.add_1(CLASS_SELECTED).unwrap();
+        let xy = get_xy(&cell);
+        *state.selected.borrow_mut() = Some(cell.clone());
+        if xy.1 == Y(0) {
+            state.selected_cell.set(false);
+            state.selected_th_or_cell.set(true);
+            state.selected_row_unpinned.set(true);
+        } else {
+            state.selected_cell.set(true);
+            state.selected_th_or_cell.set(true);
+            state.selected_row_unpinned.set(!classes.contains(CLASS_PIN_ROW));
+        }
+        state.selected_col_unpinned.set(!classes.contains(CLASS_PIN_COL));
+    }
 }
 
 pub fn create_editor(initial_data: Vec<serde_json::Value>) -> Result<El, String> {
@@ -1561,367 +1645,262 @@ pub fn create_editor(initial_data: Vec<serde_json::Value>) -> Result<El, String>
     }
 
     // Construct
-    let eg = EventGraph::new();
     let root = el("div").classes(&[CLASS_ROOT]);
-    eg.event({
-        let root = root.clone();
-        move |pc| {
-            // Create base editor framework
-            let table_thr = el("tr");
-            let table = el("table").push(el("tbody").push(table_thr.clone()));
-            let state = Rc::new(State {
-                root: root.clone(),
-                table_thr: table_thr,
-                edit_clock: RefCell::new(0),
-                edit_clock_ticker: RefCell::new(None),
-                undo: RefCell::new(vec![]),
-                redo: RefCell::new(vec![]),
-                last_change: Cell::new(Instant::now()),
-                current_undo_level: RefCell::new(ChangeLevel {
-                    selection: None,
-                    changes: vec![],
-                }),
-                selected: RefCell::new(None),
-                pin_resize_observer: OnceCell::new(),
-                always: Prim::new(pc, true),
-                selected_th_or_cell: Prim::new(pc, false),
-                selected_cell: Prim::new(pc, false),
-                selected_col_unpinned: Prim::new(pc, false),
-                selected_row_unpinned: Prim::new(pc, false),
-                has_undo: Prim::new(pc, false),
-                has_redo: Prim::new(pc, false),
-            });
-            state.pin_resize_observer.get_or_init(|| {
-                return ResizeObserver::new({
-                    let state = state.clone();
-                    move |elements| {
-                        let mut min_x: Option<(usize, Element)> = None;
-                        let mut min_y: Option<(usize, Element)> = None;
-                        for el in elements {
-                            let el = el.dyn_into::<Element>().unwrap();
-                            let el_classes = el.class_list();
-                            if el_classes.contains(CLASS_PIN_COL) {
-                                let x = index_in_parent(&el);
-                                if min_x.is_none() || min_x.as_ref().unwrap().0 > x {
-                                    min_x = Some((x, el.clone()));
-                                }
-                            }
-                            if el_classes.contains(CLASS_PIN_ROW) {
-                                let y = index_in_parent(&el.parent_element().unwrap());
-                                if min_y.is_none() || min_y.as_ref().unwrap().0 > y {
-                                    min_y = Some((y, el.clone()));
-                                }
-                            }
-                        }
-                        if let Some((_, el)) = min_x {
-                            update_column_pin_from(&state, &el);
-                        }
-                        if let Some((_, el)) = min_y {
-                            update_row_pin_from(&el);
+
+    // Create base editor framework
+    let table_thr = el("tr");
+    let table = el("table").push(el("tbody").push(table_thr.clone()));
+    let state = Rc::new(State {
+        root: root.weak(),
+        table_thr: table_thr.weak(),
+        undo: RefCell::new(vec![]),
+        redo: RefCell::new(vec![]),
+        last_change: Cell::new(Instant::now()),
+        current_undo_level: RefCell::new(ChangeLevel {
+            selection: None,
+            changes: vec![],
+        }),
+        selected: RefCell::new(None),
+        pin_resize_observer: OnceCell::new(),
+        always: ObsBool::new(true),
+        selected_th_or_cell: ObsBool::new(false),
+        selected_cell: ObsBool::new(false),
+        selected_col_unpinned: ObsBool::new(false),
+        selected_row_unpinned: ObsBool::new(false),
+        has_undo: ObsBool::new(false),
+        has_redo: ObsBool::new(false),
+    });
+    state.pin_resize_observer.get_or_init(|| {
+        return ResizeObserver::new({
+            let state = state.clone();
+            move |elements| {
+                let mut min_x: Option<(usize, Element)> = None;
+                let mut min_y: Option<(usize, Element)> = None;
+                for el in elements {
+                    let el = el.dyn_into::<Element>().unwrap();
+                    let el_classes = el.class_list();
+                    if el_classes.contains(CLASS_PIN_COL) {
+                        let x = index_in_parent(&el);
+                        if min_x.is_none() || min_x.as_ref().unwrap().0 > x {
+                            min_x = Some((x, el.clone()));
                         }
                     }
-                });
-            });
-            let toolbar = el("div");
-            let toolbar_tab_button_sheet = el_toolbar_tab_button(pc, "Sheet", {
+                    if el_classes.contains(CLASS_PIN_ROW) {
+                        let y = index_in_parent(&el.parent_element().unwrap());
+                        if min_y.is_none() || min_y.as_ref().unwrap().0 > y {
+                            min_y = Some((y, el.clone()));
+                        }
+                    }
+                }
+                if let Some((_, el)) = min_x {
+                    update_column_pin_from(&state, &el);
+                }
+                if let Some((_, el)) = min_y {
+                    update_row_pin_from(&el);
+                }
+            }
+        });
+    });
+    let toolbar = el("div");
+    let toolbar_tab_button_sheet = el_toolbar_tab_button("Sheet", {
+        let state = state.clone();
+        let toolbar = toolbar.clone();
+        move |e| {
+            build_toolbar_sheet(&state, &e, &toolbar);
+        }
+    });
+    root.ref_extend(vec![
+        //. .
+        el("div").extend(vec![
+            //. .
+            toolbar_tab_button_sheet.clone(),
+            el_toolbar_tab_button("Column", {
                 let state = state.clone();
                 let toolbar = toolbar.clone();
-                move |pc, e| {
-                    build_toolbar_sheet(pc, &state, &e, &toolbar);
+                move |e| {
+                    build_toolbar_column(&state, &e, &toolbar);
                 }
-            });
-            root.ref_extend(vec![
-                //. .
-                el("div").extend(vec![
-                    //. .
-                    toolbar_tab_button_sheet.clone(),
-                    el_toolbar_tab_button(pc, "Column", {
-                        let state = state.clone();
-                        let toolbar = toolbar.clone();
-                        move |pc, e| {
-                            build_toolbar_column(pc, &state, &e, &toolbar);
-                        }
-                    }),
-                    el_toolbar_tab_button(pc, "Row", {
-                        let state = state.clone();
-                        let toolbar = toolbar.clone();
-                        move |pc, e| {
-                            build_toolbar_row(pc, &state, &e, &toolbar);
-                        }
-                    }),
-                    el_toolbar_tab_button(pc, "Cell", {
-                        let state = state.clone();
-                        let toolbar = toolbar.clone();
-                        move |pc, e| {
-                            build_toolbar_cell(pc, &state, &e, &toolbar);
-                        }
-                    })
-                ]),
-                toolbar.clone(),
-                table.clone()
-            ]);
-            build_toolbar_sheet(pc, &state, &toolbar_tab_button_sheet, &toolbar);
+            }),
+            el_toolbar_tab_button("Row", {
+                let state = state.clone();
+                let toolbar = toolbar.clone();
+                move |e| {
+                    build_toolbar_row(&state, &e, &toolbar);
+                }
+            }),
+            el_toolbar_tab_button("Cell", {
+                let state = state.clone();
+                let toolbar = toolbar.clone();
+                move |e| {
+                    build_toolbar_cell(&state, &e, &toolbar);
+                }
+            })
+        ]),
+        toolbar.clone(),
+        table.clone()
+    ]);
+    build_toolbar_sheet(&state, &toolbar_tab_button_sheet, &toolbar);
 
-            // Chained cbs for value maintenance
-            table.ref_on("focusin", {
-                let eg = pc.eg();
-                let state = state.clone();
-                move |ev| eg.event(|pc| {
-                    console::log_1(&JsValue::from(format!("(focus)")));
-                    let tick = edit_tick(&state);
-                    let e = shed!{
-                        let Some(e) = ev.target() else {
-                            return;
-                        };
-                        let Ok(e) = e.dyn_into::<HtmlElement>() else {
-                            return;
-                        };
-                        e
-                    };
-                    let cell = find_containing_cell(&e).unwrap();
-                    let classes = cell.class_list();
-                    classes.add_1(CLASS_SELECTED).unwrap();
-                    let xy = get_xy(&cell);
-                    *state.selected.borrow_mut() = Some((tick, cell.clone()));
-                    if xy.1 == Y(0) {
-                        state.selected_cell.set(pc, false);
-                        state.selected_th_or_cell.set(pc, true);
-                        state.selected_col_unpinned.set(pc, false);
-                    } else {
-                        state.selected_cell.set(pc, true);
-                        state.selected_th_or_cell.set(pc, true);
-                        state.selected_col_unpinned.set(pc, !classes.contains(CLASS_PIN_ROW));
-                    }
-                    state.selected_col_unpinned.set(pc, !classes.contains(CLASS_PIN_COL));
-                })
-            });
-            table.ref_on("focusout", {
-                let eg = pc.eg();
-                let state = state.clone();
-                move |ev| eg.event(|pc| {
-                    _ = edit_tick(&state);
-                    console::log_1(&JsValue::from(format!("(blur)")));
-                    let e = shed!{
-                        let Some(e) = ev.target() else {
-                            return;
-                        };
-                        let Ok(e) = e.dyn_into::<HtmlElement>() else {
-                            return;
-                        };
-                        e
-                    };
-                    let cell = find_containing_cell(&e).unwrap();
-                    cell.class_list().remove_1(CLASS_SELECTED).unwrap();
-                    stop_editing_cell(&cell);
-                    cell.dyn_ref::<HtmlElement>().unwrap().blur().unwrap();
-                    if Some(&cell) == state.selected.borrow().as_ref().map(|s| &s.1) {
-                        state.selected_cell.set(pc, false);
-                        state.selected_th_or_cell.set(pc, false);
-                        state.selected_col_unpinned.set(pc, false);
-                        state.selected_row_unpinned.set(pc, false);
-                        *state.selected.borrow_mut() = None;
-                    }
-                })
-            });
+    // Add initial data
+    apply(&state, Change::Splice(ChangeSplice {
+        start: (X(0), Y(0)),
+        remove: (X(0), Y(0)),
+        add_columns: initial_add_columns.into_iter().map(|c| vec![v_str(c)]).collect(),
+        add_rows: initial_add_rows,
+    }));
+    select(&state, (X(0), Y(0)));
 
-            // Add initial data
-            apply(&state, Change::Splice(ChangeSplice {
-                start: (X(0), Y(0)),
-                remove: (X(0), Y(0)),
-                add_columns: initial_add_columns.into_iter().map(|c| SpliceColumn {
-                    title: c,
-                    cells: vec![],
-                }).collect(),
-                add_rows: initial_add_rows,
-            }));
-            select(&state, (X(0), Y(0)));
-
-            // Action event handling
-            let text_obs;
-            {
-                let eg = pc.eg();
-                let state = state.clone();
-                let js_cb = Closure::wrap(Box::new(move |changes: Array, _| -> () {
-                    eg.event(|pc| {
-                        for change in changes {
-                            let change = change.dyn_into::<MutationRecord>().unwrap();
-                            let Some(cell) =
-                                find_containing_cell(&change.target().unwrap().dyn_into::<Node>().unwrap()) else {
-                                    continue;
-                                };
-                            let xy = get_xy(&cell);
-                            let cell_change;
-                            cell_change =
-                                Value::from_str(&cell.get_attribute(ATTR_TH_CELL_OLD_VALUE).unwrap()).unwrap();
-                            let new_value = get_value(&cell);
-                            cell.set_attribute(ATTR_TH_CELL_OLD_VALUE, &new_value.to_string()).unwrap();
-                            validate_cell(&cell, &new_value);
-                            push_undo(
-                                pc,
-                                &state,
-                                Some(xy),
-                                Change::Cells(ChangeCells { cells: [(xy, cell_change)].into_iter().collect() }),
-                            );
-                        }
-                    })
-                }) as Box<dyn Fn(Array, JsValue)>);
-                text_obs = MutationObserver::new(js_cb.as_ref().unchecked_ref()).unwrap();
-                root.ref_own(|_| js_cb);
-            };
-            text_obs.observe_with_options(&table.raw(), &{
-                let o = MutationObserverInit::new();
-                o.set_character_data(true);
-                o.set_subtree(true);
-                o
-            }).unwrap();
-            table.ref_on_with_options("keydown", EventListenerOptions {
-                phase: EventListenerPhase::Bubble,
-                passive: false,
-            }, {
-                let eg = pc.eg();
-                let state = state.clone();
-                move |ev| eg.event(|pc| {
-                    edit_tick(&state);
-                    let ev = ev.dyn_ref::<KeyboardEvent>().unwrap();
-                    console::log_1(
-                        &JsValue::from(
-                            format!("key event {}, alt {}, ctrl {}", ev.key(), ev.alt_key(), ev.ctrl_key()),
-                        ),
-                    );
-                    if let Some(cell) = find_containing_cell(&ev.target().unwrap().dyn_into::<Node>().unwrap()) {
-                        let xy = get_xy(&cell);
-                        if cell.class_list().contains(CLASS_EDITING) {
-                            match ev.key().as_str() {
-                                "Escape" => {
-                                    stop_editing_cell(&cell);
-                                    ev.prevent_default();
-                                },
-                                _ => {
-                                    // nop
-                                },
-                            }
-                        } else {
-                            match ev.key().as_str() {
-                                "ArrowUp" => {
-                                    if ev.ctrl_key() && xy.1 >= Y(1) {
-                                        act_add_up(pc, &state);
-                                        ev.prevent_default();
-                                    } else {
-                                        if xy.1 == Y(0) {
-                                            console::log_1(&JsValue::from(format!("up, at 1 -> exit")));
-                                            return;
-                                        }
-                                        console::log_1(&JsValue::from(format!("up, sel up 0")));
-                                        select(&state, (xy.0, xy.1 - Y(1)));
-                                        ev.prevent_default();
-                                        console::log_1(&JsValue::from(format!("up, sel up")));
-                                    }
-                                },
-                                "ArrowDown" => {
-                                    if ev.ctrl_key() && xy.1 >= Y(1) {
-                                        act_add_down(pc, &state);
-                                        ev.prevent_default();
-                                    } else {
-                                        if xy.1 == row_count(&state) {
-                                            return;
-                                        }
-                                        select(&state, (xy.0, xy.1 + Y(1)));
-                                        ev.prevent_default();
-                                    }
-                                },
-                                "ArrowLeft" => {
-                                    if ev.ctrl_key() {
-                                        act_add_left(pc, &state);
-                                        ev.prevent_default();
-                                    } else {
-                                        if xy.0 == X(0) {
-                                            return;
-                                        }
-                                        select(&state, (xy.0 - X(1), xy.1));
-                                        ev.prevent_default();
-                                    }
-                                },
-                                "ArrowRight" => {
-                                    if ev.ctrl_key() {
-                                        act_add_right(pc, &state);
-                                        ev.prevent_default();
-                                    } else {
-                                        if xy.0 == column_count(&state) {
-                                            return;
-                                        }
-                                        select(&state, (xy.0 + X(1), xy.1));
-                                        ev.prevent_default();
-                                    }
-                                },
-                                "Enter" => {
-                                    start_editing_cell(pc, &state, &cell);
-                                    ev.prevent_default();
-                                },
-                                _ => { },
-                            }
-                        }
+    // Action event handling
+    let text_obs;
+    {
+        let state = state.clone();
+        let js_cb = Closure::wrap(Box::new(move |changes: Array, _| -> () {
+            for change in changes {
+                let change = change.dyn_into::<MutationRecord>().unwrap();
+                let Some(cell) = find_containing_cell(&change.target().unwrap().dyn_into::<Node>().unwrap()) else {
+                    continue;
+                };
+                let xy = get_xy(&cell);
+                let cell_change;
+                cell_change = Value::from_str(&cell.get_attribute(ATTR_TH_CELL_OLD_VALUE).unwrap()).unwrap();
+                let new_value = get_value(&cell);
+                cell.set_attribute(ATTR_TH_CELL_OLD_VALUE, &new_value.to_string()).unwrap();
+                validate_cell(&cell, &new_value);
+                push_undo(
+                    &state,
+                    Some(xy),
+                    Change::Cells(ChangeCells { cells: [(xy, cell_change)].into_iter().collect() }),
+                );
+            }
+        }) as Box<dyn Fn(Array, JsValue)>);
+        text_obs = MutationObserver::new(js_cb.as_ref().unchecked_ref()).unwrap();
+        root.ref_own(|_| js_cb);
+    };
+    text_obs.observe_with_options(&table.raw(), &{
+        let o = MutationObserverInit::new();
+        o.set_character_data(true);
+        o.set_subtree(true);
+        o
+    }).unwrap();
+    table.ref_on_with_options("keydown", EventListenerOptions {
+        phase: EventListenerPhase::Bubble,
+        passive: false,
+    }, {
+        let state = state.clone();
+        move |ev| {
+            let ev = ev.dyn_ref::<KeyboardEvent>().unwrap();
+            if let Some(cell) = find_containing_cell(&ev.target().unwrap().dyn_into::<Node>().unwrap()) {
+                let xy = get_xy(&cell);
+                if cell.class_list().contains(CLASS_EDITING) {
+                    match ev.key().as_str() {
+                        "Escape" => {
+                            stop_editing_cell(&cell);
+                            ev.prevent_default();
+                        },
+                        _ => {
+                            // nop
+                        },
                     }
-                })
-            });
-            table.ref_on_with_options("click", EventListenerOptions {
-                phase: EventListenerPhase::Bubble,
-                passive: false,
-            }, {
-                let eg = pc.eg();
-                let state = state.clone();
-                move |ev| eg.event(|pc| {
-                    let tick = edit_tick(&state);
-                    console::log_1(&JsValue::from(format!("Click")));
-                    let Some(cell) = find_containing_cell(&ev.target().unwrap().dyn_into::<Node>().unwrap()) else {
-                        console::log_1(&JsValue::from(format!("No cell at click")));
-                        return;
-                    };
-                    superif!({
-                        let Some(active_element) = document().active_element() else {
-                            console::log_1(&JsValue::from(format!("No active el")));
-                            break 'unedit;
-                        };
-                        if active_element != cell {
-                            console::log_1(&JsValue::from(format!("Selected/active el different")));
-                            break 'unedit;
-                        }
-                        let was_selected = superif!({
-                            let selected = state.selected.borrow();
-                            let Some((select_tick, select_el)) = selected.as_ref() else {
-                                break 'no;
-                            };
-                            if *select_tick == tick {
-                                break 'no;
-                            }
-                            if &cell != select_el {
-                                break 'no;
-                            }
-                            console::log_1(
-                                &JsValue::from(format!("Start editing - tick {} v {}", tick, *select_tick)),
-                            );
-                            break true;
-                        } 'no {
-                            break false;
-                        });
-                        if was_selected {
-                            if !cell.class_list().contains(CLASS_EDITING) {
-                                console::log_1(&JsValue::from(format!("Start editing")));
-                                start_editing_cell(pc, &state, &cell);
+                } else {
+                    match ev.key().as_str() {
+                        "ArrowUp" => {
+                            if ev.ctrl_key() && xy.1 >= Y(1) {
+                                act_add_up(&state);
                                 ev.prevent_default();
                             } else {
-                                console::log_1(&JsValue::from(format!("Already editing")));
+                                if xy.1 == Y(0) {
+                                    return;
+                                }
+                                select(&state, (xy.0, xy.1 - Y(1)));
+                                ev.prevent_default();
                             }
-                        } else {
-                            console::log_1(&JsValue::from(format!("Fresh selection")));
-                        }
-                    } 'unedit {
-                        if cell.class_list().contains(CLASS_EDITING) {
-                            stop_editing_cell(&cell);
-                        } else {
-                            console::log_1(&JsValue::from(format!("Unedit, not editing")));
-                        }
-                    });
-                })
+                        },
+                        "ArrowDown" => {
+                            if ev.ctrl_key() && xy.1 >= Y(1) {
+                                act_add_down(&state);
+                                ev.prevent_default();
+                            } else {
+                                if xy.1 == row_count(&state) {
+                                    return;
+                                }
+                                select(&state, (xy.0, xy.1 + Y(1)));
+                                ev.prevent_default();
+                            }
+                        },
+                        "ArrowLeft" => {
+                            if ev.ctrl_key() {
+                                act_add_left(&state);
+                                ev.prevent_default();
+                            } else {
+                                if xy.0 == X(0) {
+                                    return;
+                                }
+                                select(&state, (xy.0 - X(1), xy.1));
+                                ev.prevent_default();
+                            }
+                        },
+                        "ArrowRight" => {
+                            if ev.ctrl_key() {
+                                act_add_right(&state);
+                                ev.prevent_default();
+                            } else {
+                                if xy.0 == column_count(&state) {
+                                    return;
+                                }
+                                select(&state, (xy.0 + X(1), xy.1));
+                                ev.prevent_default();
+                            }
+                        },
+                        "Enter" => {
+                            start_editing_cell(&state, &cell);
+                            ev.prevent_default();
+                        },
+                        _ => { },
+                    }
+                }
+            }
+        }
+    });
+    table.ref_on_with_options("click", EventListenerOptions {
+        phase: EventListenerPhase::Bubble,
+        passive: false,
+    }, {
+        let state = state.clone();
+        move |ev| {
+            let Some(cell) = find_containing_cell(&ev.target().unwrap().dyn_into::<Node>().unwrap()) else {
+                return;
+            };
+            superif!({
+                let Some(active_element) = document().active_element() else {
+                    break 'unedit;
+                };
+                if active_element != cell {
+                    break 'unedit;
+                }
+                let was_selected = superif!({
+                    let selected = state.selected.borrow();
+                    let Some(select_el) = selected.as_ref() else {
+                        break 'no;
+                    };
+                    if &cell != select_el {
+                        break 'no;
+                    }
+                    break true;
+                } 'no {
+                    break false;
+                });
+                if was_selected {
+                    if !cell.class_list().contains(CLASS_EDITING) {
+                        start_editing_cell(&state, &cell);
+                        ev.prevent_default();
+                    }
+                } else {
+                    register_select(&state, &cell);
+                }
+            } 'unedit {
+                if cell.class_list().contains(CLASS_EDITING) {
+                    stop_editing_cell(&cell);
+                }
             });
         }
     });
