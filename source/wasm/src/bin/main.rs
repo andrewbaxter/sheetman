@@ -7,7 +7,17 @@ use {
         shed,
         superif,
     },
-    gloo::utils::document,
+    gloo::{
+        events::{
+            EventListenerOptions,
+            EventListenerPhase,
+        },
+        timers::callback::Timeout,
+        utils::{
+            document,
+            window,
+        },
+    },
     js_sys::Array,
     lunk::{
         link,
@@ -27,6 +37,10 @@ use {
     },
     serde_json::Number,
     std::{
+        borrow::{
+            Borrow,
+            BorrowMut,
+        },
         cell::{
             Cell,
             OnceCell,
@@ -90,7 +104,7 @@ static ICON_TYPE_MISSING: &str = "type_missing";
 static ICON_TYPE_JSON: &str = "type_null";
 static CLASS_DISABLED: &str = "disabled";
 static CLASS_INVALID: &str = "invalid";
-static CLASS_SELECTED: &str = "selected";
+static CLASS_EDITING: &str = "editing";
 static CLASS_PIN_COL: &str = "pin_coll";
 static CLASS_PIN_ROW: &str = "pin_row";
 static CLASS_BUTTON_PIN: &str = "button_pin";
@@ -103,8 +117,7 @@ static ATTR_VALUE_TYPE_JSON: &str = "json";
 static ATTR_VALUE_TYPE_NULL: &str = "null";
 static ATTR_VALUE_TYPE_MISSING: &str = "missing";
 static ATTR_VALUE_TYPE_NUMBER: &str = "number";
-static ATTR_CELL_OLD_VALUE: &str = "cell_old";
-static ATTR_TH_OLD_TEXT: &str = "th_old";
+static ATTR_TH_CELL_OLD_VALUE: &str = "cell_old";
 static ATTR_CONTENTEDITABLE: &str = "contenteditable";
 static ATTR_CONTENTEDITABLE_PLAINTEXT: &str = "plaintext-only";
 static ATTR_TABINDEX: &str = "tabindex";
@@ -229,12 +242,6 @@ struct SpliceColumn {
 }
 
 #[derive(Clone)]
-struct ChangeColumnTitle {
-    coord: X,
-    title: String,
-}
-
-#[derive(Clone)]
 struct ChangeCells {
     cells: HashMap<Coord2, Value>,
 }
@@ -251,39 +258,50 @@ struct ChangeSplice {
 
 #[derive(Clone)]
 enum Change {
-    ColumnTitle(ChangeColumnTitle),
     Cells(ChangeCells),
     Splice(ChangeSplice),
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-enum Selection {
-    Header(X),
-    Cell(Coord2),
-}
-
 #[derive(Clone)]
 struct ChangeLevel {
-    selection: Selection,
+    selection: Option<Coord2>,
     changes: Vec<Change>,
 }
 
 struct State {
     root: El,
     table_thr: El,
+    edit_clock: RefCell<usize>,
+    edit_clock_ticker: RefCell<Option<Timeout>>,
     undo: RefCell<Vec<ChangeLevel>>,
     redo: RefCell<Vec<ChangeLevel>>,
     last_change: Cell<Instant>,
     current_undo_level: RefCell<ChangeLevel>,
-    mode_edit_text: Cell<bool>,
-    selection: Cell<Selection>,
     always: Prim<bool>,
+    selected: RefCell<Option<(usize, Element)>>,
+    selected_th_or_cell: Prim<bool>,
     selected_cell: Prim<bool>,
     selected_col_unpinned: Prim<bool>,
     selected_row_unpinned: Prim<bool>,
     has_undo: Prim<bool>,
     has_redo: Prim<bool>,
     pin_resize_observer: OnceCell<ResizeObserver>,
+}
+
+fn edit_tick(state: &Rc<State>) -> usize {
+    console::log_1(&JsValue::from(format!("edit_tick start; {}", *state.edit_clock.borrow())));
+    let mut gt = state.edit_clock_ticker.borrow_mut();
+    if gt.is_none() {
+        *gt = Some(Timeout::new(500, {
+            let state = state.clone();
+            move || {
+                *state.edit_clock.borrow_mut() += 1;
+                console::log_1(&JsValue::from(format!("edit_tick tick cb; {}", *state.edit_clock.borrow())));
+                *state.edit_clock_ticker.borrow_mut() = None;
+            }
+        }));
+    }
+    return *state.edit_clock.borrow();
 }
 
 fn flush_undo(pc: &mut ProcessingContext, state: &State) {
@@ -296,7 +314,7 @@ fn flush_undo(pc: &mut ProcessingContext, state: &State) {
     state.has_undo.set(pc, true);
 }
 
-fn push_undo_no_merge(pc: &mut ProcessingContext, state: &State, sel: Selection, change: Change) {
+fn push_undo_no_merge(pc: &mut ProcessingContext, state: &State, sel: Option<Coord2>, change: Change) {
     let mut current_undo_level = state.current_undo_level.borrow_mut();
     if current_undo_level.changes.is_empty() {
         current_undo_level.selection = sel;
@@ -307,7 +325,7 @@ fn push_undo_no_merge(pc: &mut ProcessingContext, state: &State, sel: Selection,
     state.has_redo.set(pc, false);
 }
 
-fn push_undo(pc: &mut ProcessingContext, state: &State, sel: Selection, change: Change) {
+fn push_undo(pc: &mut ProcessingContext, state: &State, sel: Option<Coord2>, change: Change) {
     if Instant::now().saturating_duration_since(state.last_change.get()) > Duration::from_millis(200) {
         flush_undo(pc, state);
     }
@@ -368,16 +386,15 @@ fn apply_cell_value(cell: &Element, new_value: &Value) {
         ValueType::Null => ATTR_VALUE_TYPE_NULL,
         ValueType::Missing => ATTR_VALUE_TYPE_MISSING,
     }).unwrap();
-    cell.set_attribute(ATTR_CELL_OLD_VALUE, &new_value.to_string()).unwrap();
+    cell.set_attribute(ATTR_TH_CELL_OLD_VALUE, &new_value.to_string()).unwrap();
     validate_cell(cell, &new_value);
 }
 
 fn build_th(title: &str) -> Element {
     let out = document().create_element("th").unwrap();
-    out.set_attribute(ATTR_CONTENTEDITABLE, ATTR_CONTENTEDITABLE_PLAINTEXT).unwrap();
     out.set_attribute(ATTR_TABINDEX, "0").unwrap();
     out.set_text_content(Some(&title));
-    out.set_attribute(ATTR_TH_OLD_TEXT, title).unwrap();
+    apply_cell_value(&out, &v_str(title));
     return out;
 }
 
@@ -388,23 +405,45 @@ fn build_cell(new_value: &Value) -> Element {
     return out;
 }
 
-fn apply(state: &State, change: Change) -> (Option<Selection>, Change) {
+fn find_containing_cell(start: &Node) -> Option<Element> {
+    let mut at = start.clone();
+    loop {
+        shed!{
+            if at.node_type() != Node::ELEMENT_NODE {
+                break;
+            }
+            let el = at.dyn_ref::<Element>().unwrap();
+            let el_tag = el.tag_name().to_ascii_lowercase();
+            if el_tag == "table" || el_tag == "tr" {
+                return None;
+            }
+            if el_tag == "th" || el_tag == "td" {
+                return Some(el.clone());
+            }
+        };
+        let Some(at1) = at.parent_node() else {
+            return None;
+        };
+        at = at1;
+    };
+}
+
+fn apply(state: &State, change: Change) -> (Option<Coord2>, Change) {
     match change {
-        Change::ColumnTitle(change) => {
-            let h = state.table_thr.raw().children().item(change.coord.0 as u32).unwrap();
-            let out = Change::ColumnTitle(ChangeColumnTitle {
-                coord: change.coord,
-                title: h.text_content().unwrap(),
-            });
-            h.set_text_content(Some(&change.title));
-            return (None, out);
-        },
         Change::Cells(change) => {
             let mut out = HashMap::new();
             for (xy, new_value) in change.cells {
                 let cell = get_cell(state, xy).unwrap();
-                out.insert(xy, get_value(&cell));
-                apply_cell_value(&cell, &new_value);
+                if xy.1 == Y(0) {
+                    if new_value.type_ != ValueType::String {
+                        panic!();
+                    }
+                    out.insert(xy, v_str(&cell.text_content().unwrap()));
+                    apply_cell_value(&cell, &new_value);
+                } else {
+                    out.insert(xy, get_value(&cell));
+                    apply_cell_value(&cell, &new_value);
+                }
             }
             return (None, Change::Cells(ChangeCells { cells: out }));
         },
@@ -412,6 +451,7 @@ fn apply(state: &State, change: Change) -> (Option<Selection>, Change) {
             let parent = state.table_thr.raw().parent_element().unwrap();
             let children = parent.children();
             let rev_change_remove = (X(change.add_columns.len() as i64), Y(change.add_rows.len() as i64));
+            let old_selection = find_selection().map(|s| s.0);
 
             // Remove rows
             let mut rev_add_rows = vec![];
@@ -479,33 +519,39 @@ fn apply(state: &State, change: Change) -> (Option<Selection>, Change) {
 
             // Adjust selection
             let new_selection;
-            match state.selection.get() {
-                Selection::Header(_) => {
-                    if change.start.0 == column_count(state) {
-                        new_selection = Selection::Header(change.start.0 - X(1));
-                    } else {
-                        new_selection = Selection::Header(change.start.0);
-                    }
-                },
-                Selection::Cell(_) => {
-                    new_selection = Selection::Cell((if change.start.0 == column_count(state) {
+            if let Some((old_x, old_y)) = old_selection {
+                let new_x;
+                if old_x < change.start.0 {
+                    new_x = old_x;
+                } else {
+                    new_x = if change.start.0 == column_count(state) {
                         change.start.0 - X(1)
                     } else {
                         change.start.0
-                    }, if change.start.1 == row_count(state) {
+                    };
+                }
+                let new_y;
+                if old_y < change.start.1 {
+                    new_y = old_y;
+                } else {
+                    new_y = if change.start.1 == row_count(state) {
                         change.start.1 - Y(1)
                     } else {
                         change.start.1
-                    }));
-                },
+                    };
+                }
+                let new_selection1 = (new_x, new_y);
+                if new_selection1 != (old_x, old_y) {
+                    new_selection = Some(new_selection1);
+                } else {
+                    new_selection = None;
+                }
+            } else {
+                new_selection = None;
             }
 
             // Return reverse change
-            return (if new_selection != state.selection.get() {
-                Some(new_selection)
-            } else {
-                None
-            }, Change::Splice(ChangeSplice {
+            return (new_selection, Change::Splice(ChangeSplice {
                 start: change.start,
                 remove: rev_change_remove,
                 add_columns: rev_add_columns,
@@ -515,44 +561,8 @@ fn apply(state: &State, change: Change) -> (Option<Selection>, Change) {
     }
 }
 
-fn select(pc: &mut ProcessingContext, state: &Rc<State>, new_sel: Selection) {
-    let old_sel = state.selection.get();
-    match old_sel {
-        Selection::Header(x) => shed!{
-            let Some(td) = state.table_thr.raw().children().item(x.0 as u32) else {
-                break;
-            };
-            td.dyn_into::<HtmlElement>().unwrap().blur().unwrap();
-        },
-        Selection::Cell(xy) => shed!{
-            if state.mode_edit_text.get() {
-                stop_editing_cell(state, xy);
-            }
-            let Some(td) = get_cell(state, xy) else {
-                break;
-            };
-            td.class_list().remove_1(CLASS_SELECTED).unwrap();
-        },
-    }
-    match new_sel {
-        Selection::Header(x) => {
-            let td = state.table_thr.raw().children().item(x.0 as u32).unwrap().dyn_into::<HtmlElement>().unwrap();
-            td.focus().unwrap();
-            state.selected_cell.set(pc, false);
-            let classes = td.class_list();
-            state.selected_col_unpinned.set(pc, !classes.contains(CLASS_PIN_COL));
-            state.selected_col_unpinned.set(pc, true);
-        },
-        Selection::Cell(xy) => {
-            let cell = get_cell(state, xy).unwrap();
-            cell.class_list().add_1(CLASS_SELECTED).unwrap();
-            state.selected_cell.set(pc, true);
-            let classes = cell.class_list();
-            state.selected_col_unpinned.set(pc, !classes.contains(CLASS_PIN_COL));
-            state.selected_col_unpinned.set(pc, !classes.contains(CLASS_PIN_ROW));
-        },
-    }
-    state.selection.set(new_sel);
+fn select(state: &Rc<State>, new_sel: Coord2) {
+    get_cell(state, new_sel).unwrap().dyn_into::<HtmlElement>().unwrap().focus().unwrap();
 }
 
 fn column_count(state: &State) -> X {
@@ -718,7 +728,7 @@ fn get_rows(state: &State) -> Vec<Element> {
 
 fn get_row(state: &State, row: Y) -> Vec<Element> {
     let mut out = vec![];
-    let row = state.table_thr.raw().parent_element().unwrap().children().item((row.0 + 1) as u32).unwrap().children();
+    let row = state.table_thr.raw().parent_element().unwrap().children().item((row.0) as u32).unwrap().children();
     for i in 0 .. row.length() {
         out.push(row.item(i).unwrap());
     }
@@ -726,7 +736,7 @@ fn get_row(state: &State, row: Y) -> Vec<Element> {
 }
 
 fn get_cell(state: &State, coord2: Coord2) -> Option<Element> {
-    let Some(row) = state.table_thr.raw().parent_element().unwrap().children().item((coord2.1.0 + 1) as u32) else {
+    let Some(row) = state.table_thr.raw().parent_element().unwrap().children().item((coord2.1.0) as u32) else {
         return None;
     };
     return row.children().item((coord2.0.0) as u32);
@@ -742,35 +752,47 @@ fn index_in_parent(e: &Element) -> usize {
     panic!();
 }
 
-fn start_editing_cell(pc: &mut ProcessingContext, state: &Rc<State>, xy: Coord2) {
-    let cell = get_cell(state, xy).unwrap();
-    let v = get_value(&cell);
-    if v.type_ == ValueType::Bool {
-        let new_string;
-        if v.string == STR_TRUE {
-            new_string = STR_FALSE.to_string();
-        } else {
-            new_string = STR_TRUE.to_string();
-        }
-        let (new_sel, rev_change) = apply(state, Change::Cells(ChangeCells { cells: [(xy, Value {
-            type_: v.type_,
-            string: new_string,
-        })].into_iter().collect() }));
-        push_undo(pc, state, Selection::Cell(xy), rev_change);
-        if let Some(new_sel) = new_sel {
-            select(pc, state, new_sel);
-        }
-    } else {
-        cell.set_attribute(ATTR_CONTENTEDITABLE, ATTR_CONTENTEDITABLE_PLAINTEXT).unwrap();
-        cell.dyn_into::<HtmlElement>().unwrap().focus().unwrap();
-        state.mode_edit_text.set(true);
+fn start_editing_cell(pc: &mut ProcessingContext, state: &Rc<State>, cell: &Element) {
+    let v = get_value(cell);
+    match v.type_ {
+        ValueType::Bool => {
+            let new_string;
+            if v.string == STR_TRUE {
+                new_string = STR_FALSE.to_string();
+            } else {
+                new_string = STR_TRUE.to_string();
+            }
+            let xy = get_xy(cell);
+            let (new_sel, rev_change) = apply(state, Change::Cells(ChangeCells { cells: [(xy, Value {
+                type_: v.type_,
+                string: new_string,
+            })].into_iter().collect() }));
+            if new_sel.is_some() {
+                panic!();
+            }
+            push_undo(pc, state, Some(xy), rev_change);
+        },
+        ValueType::String | ValueType::Number | ValueType::Json => {
+            cell.set_attribute(ATTR_CONTENTEDITABLE, ATTR_CONTENTEDITABLE_PLAINTEXT).unwrap();
+            cell.class_list().add_1(CLASS_EDITING).unwrap();
+            {
+                let sel = window().get_selection().unwrap().unwrap();
+                sel.remove_all_ranges().unwrap();
+                let range = document().create_range().unwrap();
+                let end = cell.text_content().unwrap().len();
+                range.set_start(cell, end as u32).unwrap();
+                range.set_end(cell, end as u32).unwrap();
+                sel.add_range(&range).unwrap();
+            }
+        },
+        ValueType::Null => return,
+        ValueType::Missing => return,
     }
 }
 
-fn stop_editing_cell(state: &Rc<State>, xy: Coord2) {
-    let cell = get_cell(state, xy).unwrap();
+fn stop_editing_cell(cell: &Element) {
     cell.remove_attribute(ATTR_CONTENTEDITABLE).unwrap();
-    state.mode_edit_text.set(false);
+    cell.class_list().remove_1(CLASS_EDITING).unwrap();
 }
 
 fn replace_toolbar_tab_front(state: &Rc<State>, button: &El) {
@@ -781,14 +803,27 @@ fn replace_toolbar_tab_front(state: &Rc<State>, button: &El) {
     button.ref_classes(&[CLASS_TOOLBAR_TAB_BUTTON_FRONT]);
 }
 
+fn get_xy(cell: &Element) -> Coord2 {
+    return (X(index_in_parent(&cell) as i64), Y(index_in_parent(&cell.parent_element().unwrap()) as i64));
+}
+
+fn find_selection() -> Option<(Coord2, Element)> {
+    // TODO make sure in current table
+    let Some(active) = document().active_element() else {
+        return None;
+    };
+    let Some(cell) = find_containing_cell(&active) else {
+        return None;
+    };
+    return Some((get_xy(&cell), cell));
+}
+
 fn act_add_left(pc: &mut ProcessingContext, state: &Rc<State>) {
-    let sel0 = state.selection.get();
-    let sel_x = match sel0 {
-        Selection::Header(x) => x,
-        Selection::Cell(xy) => xy.0,
+    let Some((sel_xy, _)) = find_selection() else {
+        return;
     };
     let change = Change::Splice(ChangeSplice {
-        start: (sel_x, Y(0)),
+        start: (sel_xy.0, Y(0)),
         remove: (X(0), Y(0)),
         add_columns: vec![SpliceColumn {
             title: "".to_string(),
@@ -797,24 +832,17 @@ fn act_add_left(pc: &mut ProcessingContext, state: &Rc<State>) {
         add_rows: vec![],
     });
     flush_undo(pc, &state);
-    push_undo(pc, &state, sel0, apply(&state, change).1);
+    push_undo(pc, &state, Some(sel_xy), apply(&state, change).1);
     flush_undo(pc, &state);
-    let new_sel_x = sel_x - X(1);
-    let new_sel = match sel0 {
-        Selection::Header(_) => Selection::Header(new_sel_x),
-        Selection::Cell(old_xy) => Selection::Cell((new_sel_x, old_xy.1)),
-    };
-    select(pc, &state, new_sel);
+    select(&state, (sel_xy.0 - X(1), sel_xy.1));
 }
 
 fn act_add_right(pc: &mut ProcessingContext, state: &Rc<State>) {
-    let sel = state.selection.get();
-    let sel_x = match sel {
-        Selection::Header(x) => x,
-        Selection::Cell(xy) => xy.0,
+    let Some((sel_xy, _)) = find_selection() else {
+        return;
     };
     let change = Change::Splice(ChangeSplice {
-        start: (sel_x + X(1), Y(0)),
+        start: (sel_xy.0 + X(1), Y(0)),
         remove: (X(0), Y(0)),
         add_columns: vec![SpliceColumn {
             title: "".to_string(),
@@ -823,25 +851,21 @@ fn act_add_right(pc: &mut ProcessingContext, state: &Rc<State>) {
         add_rows: vec![],
     });
     flush_undo(pc, &state);
-    push_undo(pc, &state, sel, apply(&state, change).1);
+    push_undo(pc, &state, Some(sel_xy), apply(&state, change).1);
     flush_undo(pc, &state);
-    let new_sel_x = sel_x + X(1);
-    let new_sel = match sel {
-        Selection::Header(_) => Selection::Header(new_sel_x),
-        Selection::Cell(old_xy) => Selection::Cell((new_sel_x, old_xy.1)),
-    };
-    select(pc, &state, new_sel);
+    select(&state, (sel_xy.0 + X(1), sel_xy.1));
 }
 
 fn act_add_up(pc: &mut ProcessingContext, state: &Rc<State>) {
-    let sel0 = state.selection.get();
-    let Selection::Cell(sel) = sel0 else {
-        panic!();
+    let Some((sel_xy, _)) = find_selection() else {
+        return;
     };
-    let y = sel.1;
-    let base_row = get_row(&state, y);
+    if sel_xy.1 == Y(0) {
+        return;
+    }
+    let base_row = get_row(&state, sel_xy.1);
     let change = Change::Splice(ChangeSplice {
-        start: (X(0), y),
+        start: (X(0), sel_xy.1),
         remove: (X(0), Y(0)),
         add_columns: vec![],
         add_rows: vec![base_row.into_iter().map(|base_cell| Value {
@@ -850,21 +874,21 @@ fn act_add_up(pc: &mut ProcessingContext, state: &Rc<State>) {
         }).collect()],
     });
     flush_undo(pc, &state);
-    push_undo(pc, &state, sel0, apply(&state, change).1);
+    push_undo(pc, &state, Some(sel_xy), apply(&state, change).1);
     flush_undo(pc, &state);
-    let new_sel = (sel.0, y);
-    select(pc, &state, Selection::Cell(new_sel));
+    select(&state, sel_xy);
 }
 
 fn act_add_down(pc: &mut ProcessingContext, state: &Rc<State>) {
-    let sel0 = state.selection.get();
-    let Selection::Cell(sel) = sel0 else {
-        panic!();
+    let Some((sel_xy, _)) = find_selection() else {
+        return;
     };
-    let y = sel.1;
-    let base_row = get_row(&state, y);
+    if sel_xy.1 == Y(0) {
+        return;
+    }
+    let base_row = get_row(&state, sel_xy.1);
     let change = Change::Splice(ChangeSplice {
-        start: (X(0), y + Y(1)),
+        start: (X(0), sel_xy.1 + Y(1)),
         remove: (X(0), Y(0)),
         add_columns: vec![],
         add_rows: vec![base_row.into_iter().map(|base_cell| Value {
@@ -873,28 +897,32 @@ fn act_add_down(pc: &mut ProcessingContext, state: &Rc<State>) {
         }).collect()],
     });
     flush_undo(pc, &state);
-    push_undo(pc, &state, sel0, apply(&state, change).1);
+    push_undo(pc, &state, Some(sel_xy), apply(&state, change).1);
     flush_undo(pc, &state);
-    let new_sel = (sel.0, sel.1 + Y(1));
-    select(pc, &state, Selection::Cell(new_sel));
+    select(&state, (sel_xy.0, sel_xy.1 + Y(1)));
 }
 
 fn act_undo(pc: &mut ProcessingContext, state: &Rc<State>) {
     flush_undo(pc, &state);
     if let Some(mut level) = state.undo.borrow_mut().pop() {
         let mut rev_level = ChangeLevel {
-            selection: state.selection.get(),
+            selection: find_selection().map(|s| s.0),
             changes: vec![],
         };
+        let mut last_apply_sel = None;
         while let Some(change) = level.changes.pop() {
-            rev_level.changes.push(apply(&state, change).1);
+            let (apply_sel, rev_change) = apply(&state, change);
+            rev_level.changes.push(rev_change);
+            last_apply_sel = apply_sel;
         }
         state.redo.borrow_mut().push(rev_level);
         state.has_redo.set(pc, true);
         if state.undo.borrow().is_empty() {
             state.has_undo.set(pc, false);
         }
-        select(pc, &state, level.selection);
+        if let Some(sel) = level.selection.or(last_apply_sel) {
+            select(&state, sel);
+        }
     }
 }
 
@@ -902,14 +930,19 @@ fn act_redo(pc: &mut ProcessingContext, state: &Rc<State>) {
     flush_undo(pc, &state);
     if let Some(mut level) = state.redo.borrow_mut().pop() {
         let mut rev_level = ChangeLevel {
-            selection: state.selection.get(),
+            selection: find_selection().map(|s| s.0),
             changes: vec![],
         };
+        let mut last_apply_sel = None;
         while let Some(change) = level.changes.pop() {
-            rev_level.changes.push(apply(&state, change).1);
+            let (apply_sel, rev_change) = apply(&state, change);
+            rev_level.changes.push(rev_change);
+            last_apply_sel = apply_sel;
         }
         state.undo.borrow_mut().push(rev_level);
-        select(pc, &state, level.selection);
+        if let Some(sel) = level.selection.or(last_apply_sel) {
+            select(&state, sel);
+        }
     }
 }
 
@@ -930,9 +963,9 @@ fn build_toolbar_sheet(pc: &mut ProcessingContext, state: &Rc<State>, button: &E
                     }],
                     add_rows: vec![],
                 }));
-                push_undo(pc, &state, state.selection.get(), rev_change);
+                push_undo(pc, &state, find_selection().map(|s| s.0), rev_change);
                 if let Some(new_sel) = new_sel {
-                    select(pc, &state, new_sel);
+                    select(&state, new_sel);
                 }
             }
         }),
@@ -960,12 +993,10 @@ fn build_toolbar_column(pc: &mut ProcessingContext, state: &Rc<State>, button: &
             {
                 let state = state.clone();
                 move |pc, e| {
-                    let sel0 = state.selection.get();
-                    let sel_x = match sel0 {
-                        Selection::Header(x) => x,
-                        Selection::Cell(xy) => xy.0,
+                    let Some((sel_xy, _)) = find_selection() else {
+                        return;
                     };
-                    let mut cells = get_column(&state, sel_x).into_iter();
+                    let mut cells = get_column(&state, sel_xy.0).into_iter();
                     let Some(first_cell) = cells.next() else {
                         panic!();
                     };
@@ -1020,14 +1051,12 @@ fn build_toolbar_column(pc: &mut ProcessingContext, state: &Rc<State>, button: &
         el_toolbar_button(pc, "Delete", ICON_DELETE, &state.always, {
             let state = state.clone();
             move |pc, _| {
-                let sel = state.selection.get();
-                let sel_x = match sel {
-                    Selection::Header(x) => x,
-                    Selection::Cell(xy) => xy.0,
+                let Some((sel_xy, _)) = find_selection() else {
+                    return;
                 };
                 let col_count = column_count(&state);
                 let change = Change::Splice(ChangeSplice {
-                    start: (sel_x, Y(0)),
+                    start: (sel_xy.0, Y(0)),
                     remove: (X(1), Y(0)),
                     add_columns: if col_count > X(1) {
                         vec![]
@@ -1041,20 +1070,18 @@ fn build_toolbar_column(pc: &mut ProcessingContext, state: &Rc<State>, button: &
                 });
                 let (new_sel, rev_change) = apply(&state, change);
                 flush_undo(pc, &state);
-                push_undo(pc, &state, sel, rev_change);
+                push_undo(pc, &state, Some(sel_xy), rev_change);
                 flush_undo(pc, &state);
                 if let Some(new_sel) = new_sel {
-                    select(pc, &state, new_sel);
+                    select(&state, new_sel);
                 }
             }
         }),
         el_toolbar_button(pc, "Sort", ICON_SORT, &state.always, {
             let state = state.clone();
             move |pc, _| {
-                let sel = state.selection.get();
-                let sel_x = match sel {
-                    Selection::Header(x) => x,
-                    Selection::Cell(xy) => xy.0,
+                let Some((sel_xy, _)) = find_selection() else {
+                    return;
                 };
                 let mut rows1 = vec![];
                 for row in get_rows(&state) {
@@ -1066,7 +1093,7 @@ fn build_toolbar_column(pc: &mut ProcessingContext, state: &Rc<State>, button: &
                     }
                     rows1.push(cells);
                 }
-                let col_idx = sel_x.0;
+                let col_idx = sel_xy.0.0;
                 rows1.sort_by_cached_key(|r| r.get(col_idx as usize).unwrap().clone());
                 let mut change = ChangeCells { cells: HashMap::new() };
                 for (row_idx, row) in rows1.into_iter().enumerate() {
@@ -1075,17 +1102,15 @@ fn build_toolbar_column(pc: &mut ProcessingContext, state: &Rc<State>, button: &
                     }
                 }
                 flush_undo(pc, &state);
-                push_undo(pc, &state, sel, apply(&state, Change::Cells(change)).1);
+                push_undo(pc, &state, Some(sel_xy), apply(&state, Change::Cells(change)).1);
                 flush_undo(pc, &state);
             }
         }),
         el_toolbar_button(pc, "Sort reverse", ICON_SORT_REV, &state.always, {
             let state = state.clone();
             move |pc, _| {
-                let sel = state.selection.get();
-                let sel_x = match sel {
-                    Selection::Header(x) => x,
-                    Selection::Cell(xy) => xy.0,
+                let Some((sel_xy, _)) = find_selection() else {
+                    return;
                 };
                 let mut rows1 = vec![];
                 for row in get_rows(&state) {
@@ -1097,7 +1122,7 @@ fn build_toolbar_column(pc: &mut ProcessingContext, state: &Rc<State>, button: &
                     }
                     rows1.push(cells);
                 }
-                let col_idx = sel_x.0;
+                let col_idx = sel_xy.0.0;
                 rows1.sort_by_cached_key(|r| Reverse(r.get(col_idx as usize).unwrap().clone()));
                 let mut change = ChangeCells { cells: HashMap::new() };
                 for (row_idx, row) in rows1.into_iter().enumerate() {
@@ -1106,7 +1131,7 @@ fn build_toolbar_column(pc: &mut ProcessingContext, state: &Rc<State>, button: &
                     }
                 }
                 flush_undo(pc, &state);
-                push_undo(pc, &state, sel, apply(&state, Change::Cells(change)).1);
+                push_undo(pc, &state, Some(sel_xy), apply(&state, Change::Cells(change)).1);
                 flush_undo(pc, &state);
             }
         })
@@ -1126,11 +1151,10 @@ fn build_toolbar_row(pc: &mut ProcessingContext, state: &Rc<State>, button: &El,
             {
                 let state = state.clone();
                 move |pc, e| {
-                    let sel0 = state.selection.get();
-                    let Selection::Cell(sel) = sel0 else {
-                        panic!();
+                    let Some((sel_xy, _)) = find_selection() else {
+                        return;
                     };
-                    let mut cells = get_row(&state, sel.1).into_iter();
+                    let mut cells = get_row(&state, sel_xy.1).into_iter();
                     let Some(first_cell) = cells.next() else {
                         panic!();
                     };
@@ -1185,39 +1209,36 @@ fn build_toolbar_row(pc: &mut ProcessingContext, state: &Rc<State>, button: &El,
         el_toolbar_button(pc, "Delete", ICON_DELETE, &state.selected_cell, {
             let state = state.clone();
             move |pc, _| {
-                let sel0 = state.selection.get();
-                let Selection::Cell(sel) = sel0 else {
-                    panic!();
+                let Some((sel_xy, _)) = find_selection() else {
+                    return;
                 };
                 let change = Change::Splice(ChangeSplice {
-                    start: (X(0), sel.1),
+                    start: (X(0), sel_xy.1),
                     remove: (X(0), Y(1)),
                     add_columns: vec![],
                     add_rows: vec![],
                 });
                 let (new_sel, rev_change) = apply(&state, change);
                 flush_undo(pc, &state);
-                push_undo(pc, &state, sel0, rev_change);
+                push_undo(pc, &state, Some(sel_xy), rev_change);
                 flush_undo(pc, &state);
                 if let Some(new_sel) = new_sel {
-                    select(pc, &state, new_sel);
+                    select(&state, new_sel);
                 }
             }
         }),
         el_toolbar_button(pc, "Shift up", ICON_SHIFT_UP, &state.selected_cell, {
             let state = state.clone();
             move |pc, _| {
-                let sel0 = state.selection.get();
-                let Selection::Cell(sel) = sel0 else {
-                    panic!();
+                let Some((sel_xy, _)) = find_selection() else {
+                    return;
                 };
-                if sel.1 == Y(0) {
+                if sel_xy.1 <= Y(1) {
                     return;
                 }
                 flush_undo(pc, &state);
-                let y = sel.1;
                 let change = Change::Splice(ChangeSplice {
-                    start: (X(0), y),
+                    start: (X(0), sel_xy.1),
                     remove: (X(0), Y(1)),
                     add_rows: vec![],
                     add_columns: vec![],
@@ -1226,32 +1247,30 @@ fn build_toolbar_row(pc: &mut ProcessingContext, state: &Rc<State>, button: &El,
                 let Change::Splice(rev_change_splice) = &rev_change else {
                     panic!();
                 };
-                push_undo_no_merge(pc, &state, sel0, rev_change.clone());
+                push_undo_no_merge(pc, &state, Some(sel_xy), rev_change.clone());
                 let rev_change = Change::Splice(ChangeSplice {
-                    start: (X(0), y - Y(1)),
+                    start: (X(0), sel_xy.1 - Y(1)),
                     remove: (X(0), Y(0)),
                     add_rows: rev_change_splice.add_rows.clone(),
                     add_columns: vec![],
                 });
-                push_undo_no_merge(pc, &state, sel0, rev_change.clone());
+                push_undo_no_merge(pc, &state, Some(sel_xy), rev_change.clone());
                 flush_undo(pc, &state);
-                select(pc, &state, Selection::Cell((sel.0, sel.1 - Y(1))));
+                select(&state, (sel_xy.0, sel_xy.1 - Y(1)));
             }
         }),
         el_toolbar_button(pc, "Shift down", ICON_SHIFT_DOWN, &state.selected_cell, {
             let state = state.clone();
             move |pc, _| {
-                let sel0 = state.selection.get();
-                let Selection::Cell(sel) = sel0 else {
-                    panic!();
+                let Some((sel_xy, _)) = find_selection() else {
+                    return;
                 };
-                if sel.1 == row_count(&state) {
+                if sel_xy.1 == row_count(&state) {
                     return;
                 }
                 flush_undo(pc, &state);
-                let y = sel.1;
                 let change = Change::Splice(ChangeSplice {
-                    start: (X(0), y),
+                    start: (X(0), sel_xy.1),
                     remove: (X(0), Y(1)),
                     add_rows: vec![],
                     add_columns: vec![],
@@ -1260,16 +1279,16 @@ fn build_toolbar_row(pc: &mut ProcessingContext, state: &Rc<State>, button: &El,
                 let Change::Splice(rev_change_splice) = &rev_change else {
                     panic!();
                 };
-                push_undo_no_merge(pc, &state, sel0, rev_change.clone());
+                push_undo_no_merge(pc, &state, Some(sel_xy), rev_change.clone());
                 let rev_change = Change::Splice(ChangeSplice {
-                    start: (X(0), y + Y(1)),
+                    start: (X(0), sel_xy.1 + Y(1)),
                     remove: (X(0), Y(0)),
                     add_rows: rev_change_splice.add_rows.clone(),
                     add_columns: vec![],
                 });
-                push_undo_no_merge(pc, &state, sel0, rev_change.clone());
+                push_undo_no_merge(pc, &state, Some(sel_xy), rev_change.clone());
                 flush_undo(pc, &state);
-                select(pc, &state, Selection::Cell((sel.0, sel.1 + Y(1))));
+                select(&state, (sel_xy.0, sel_xy.1 + Y(1)));
             }
         })
     ]);
@@ -1283,11 +1302,13 @@ fn build_toolbar_cell(pc: &mut ProcessingContext, state: &Rc<State>, button: &El
         el_toolbar_button(pc, "String", ICON_TYPE_STRING, &state.selected_cell, {
             let state = state.clone();
             move |pc, _| {
-                let sel0 = state.selection.get();
-                let Selection::Cell(sel) = sel0 else {
-                    panic!();
+                let Some((sel_xy, sel)) = find_selection() else {
+                    return;
                 };
-                let value = get_value(&get_cell(&state, sel).unwrap());
+                if sel_xy.1 == Y(0) {
+                    return;
+                }
+                let value = get_value(&sel);
                 let new_string;
                 shed!{
                     match value.type_ {
@@ -1304,7 +1325,7 @@ fn build_toolbar_cell(pc: &mut ProcessingContext, state: &Rc<State>, button: &El
                     }
                     new_string = value.string;
                 };
-                let cell_change = (sel, Value {
+                let cell_change = (sel_xy, Value {
                     type_: ValueType::String,
                     string: new_string,
                 });
@@ -1313,17 +1334,19 @@ fn build_toolbar_cell(pc: &mut ProcessingContext, state: &Rc<State>, button: &El
                 if new_sel.is_some() {
                     panic!();
                 }
-                push_undo(pc, &state, sel0, rev_change);
+                push_undo(pc, &state, Some(sel_xy), rev_change);
             }
         }),
         el_toolbar_button(pc, "Number", ICON_TYPE_NUMBER, &state.selected_cell, {
             let state = state.clone();
             move |pc, _| {
-                let sel0 = state.selection.get();
-                let Selection::Cell(sel) = sel0 else {
-                    panic!();
+                let Some((sel_xy, sel)) = find_selection() else {
+                    return;
                 };
-                let value = get_value(&get_cell(&state, sel).unwrap());
+                if sel_xy.1 == Y(0) {
+                    return;
+                }
+                let value = get_value(&sel);
                 let new_string;
                 shed!{
                     match value.type_ {
@@ -1346,7 +1369,7 @@ fn build_toolbar_cell(pc: &mut ProcessingContext, state: &Rc<State>, button: &El
                     }
                     new_string = "".to_string();
                 };
-                let cell_change = (sel, Value {
+                let cell_change = (sel_xy, Value {
                     type_: ValueType::Number,
                     string: new_string,
                 });
@@ -1355,17 +1378,19 @@ fn build_toolbar_cell(pc: &mut ProcessingContext, state: &Rc<State>, button: &El
                 if new_sel.is_some() {
                     panic!();
                 }
-                push_undo(pc, &state, sel0, rev_change);
+                push_undo(pc, &state, Some(sel_xy), rev_change);
             }
         }),
         el_toolbar_button(pc, "Bool", ICON_TYPE_BOOL, &state.selected_cell, {
             let state = state.clone();
             move |pc, _| {
-                let sel0 = state.selection.get();
-                let Selection::Cell(sel) = sel0 else {
-                    panic!();
+                let Some((sel_xy, sel)) = find_selection() else {
+                    return;
                 };
-                let value = get_value(&get_cell(&state, sel).unwrap());
+                if sel_xy.1 == Y(0) {
+                    return;
+                }
+                let value = get_value(&sel);
                 let new_string;
                 shed!{
                     match value.type_ {
@@ -1388,7 +1413,7 @@ fn build_toolbar_cell(pc: &mut ProcessingContext, state: &Rc<State>, button: &El
                     }
                     new_string = STR_FALSE.to_string();
                 };
-                let cell_change = (sel, Value {
+                let cell_change = (sel_xy, Value {
                     type_: ValueType::Bool,
                     string: new_string,
                 });
@@ -1397,24 +1422,26 @@ fn build_toolbar_cell(pc: &mut ProcessingContext, state: &Rc<State>, button: &El
                 if new_sel.is_some() {
                     panic!();
                 }
-                push_undo(pc, &state, sel0, rev_change);
+                push_undo(pc, &state, Some(sel_xy), rev_change);
             }
         }),
         el_toolbar_button(pc, "Json", ICON_TYPE_JSON, &state.selected_cell, {
             let state = state.clone();
             move |pc, _| {
-                let sel0 = state.selection.get();
-                let Selection::Cell(sel) = sel0 else {
-                    panic!();
+                let Some((sel_xy, sel)) = find_selection() else {
+                    return;
                 };
-                let value = get_value(&get_cell(&state, sel).unwrap());
+                if sel_xy.1 == Y(0) {
+                    return;
+                }
+                let value = get_value(&sel);
                 let new_string;
                 if let Some(json) = to_json(&value) {
                     new_string = serde_json::to_string(&json).unwrap();
                 } else {
                     new_string = value.string;
                 };
-                let cell_change = (sel, Value {
+                let cell_change = (sel_xy, Value {
                     type_: ValueType::Json,
                     string: new_string,
                 });
@@ -1423,17 +1450,19 @@ fn build_toolbar_cell(pc: &mut ProcessingContext, state: &Rc<State>, button: &El
                 if new_sel.is_some() {
                     panic!();
                 }
-                push_undo(pc, &state, sel0, rev_change);
+                push_undo(pc, &state, Some(sel_xy), rev_change);
             }
         }),
         el_toolbar_button(pc, "Null", ICON_TYPE_NULL, &state.selected_cell, {
             let state = state.clone();
             move |pc, _| {
-                let sel0 = state.selection.get();
-                let Selection::Cell(sel) = sel0 else {
-                    panic!();
+                let Some((sel_xy, _)) = find_selection() else {
+                    return;
                 };
-                let cell_change = (sel, Value {
+                if sel_xy.1 == Y(0) {
+                    return;
+                }
+                let cell_change = (sel_xy, Value {
                     type_: ValueType::Null,
                     string: "".to_string(),
                 });
@@ -1442,17 +1471,19 @@ fn build_toolbar_cell(pc: &mut ProcessingContext, state: &Rc<State>, button: &El
                 if new_sel.is_some() {
                     panic!();
                 }
-                push_undo(pc, &state, sel0, rev_change);
+                push_undo(pc, &state, Some(sel_xy), rev_change);
             }
         }),
         el_toolbar_button(pc, "Missing", ICON_TYPE_MISSING, &state.selected_cell, {
             let state = state.clone();
             move |pc, _| {
-                let sel0 = state.selection.get();
-                let Selection::Cell(sel) = sel0 else {
-                    panic!();
+                let Some((sel_xy, _)) = find_selection() else {
+                    return;
                 };
-                let cell_change = (sel, Value {
+                if sel_xy.1 == Y(0) {
+                    return;
+                }
+                let cell_change = (sel_xy, Value {
                     type_: ValueType::Missing,
                     string: "".to_string(),
                 });
@@ -1461,7 +1492,7 @@ fn build_toolbar_cell(pc: &mut ProcessingContext, state: &Rc<State>, button: &El
                 if new_sel.is_some() {
                     panic!();
                 }
-                push_undo(pc, &state, sel0, rev_change);
+                push_undo(pc, &state, Some(sel_xy), rev_change);
             }
         })
     ]);
@@ -1542,17 +1573,19 @@ pub fn create_editor(initial_data: Vec<serde_json::Value>) -> Result<El, String>
             let state = Rc::new(State {
                 root: root.clone(),
                 table_thr: table_thr,
+                edit_clock: RefCell::new(0),
+                edit_clock_ticker: RefCell::new(None),
                 undo: RefCell::new(vec![]),
                 redo: RefCell::new(vec![]),
                 last_change: Cell::new(Instant::now()),
                 current_undo_level: RefCell::new(ChangeLevel {
-                    selection: Selection::Cell((X(0), Y(0))),
+                    selection: None,
                     changes: vec![],
                 }),
-                selection: Cell::new(Selection::Cell((X(0), Y(0)))),
+                selected: RefCell::new(None),
                 pin_resize_observer: OnceCell::new(),
-                mode_edit_text: Cell::new(false),
                 always: Prim::new(pc, true),
+                selected_th_or_cell: Prim::new(pc, false),
                 selected_cell: Prim::new(pc, false),
                 selected_col_unpinned: Prim::new(pc, false),
                 selected_row_unpinned: Prim::new(pc, false),
@@ -1630,6 +1663,66 @@ pub fn create_editor(initial_data: Vec<serde_json::Value>) -> Result<El, String>
             ]);
             build_toolbar_sheet(pc, &state, &toolbar_tab_button_sheet, &toolbar);
 
+            // Chained cbs for value maintenance
+            table.ref_on("focusin", {
+                let eg = pc.eg();
+                let state = state.clone();
+                move |ev| eg.event(|pc| {
+                    console::log_1(&JsValue::from(format!("(focus)")));
+                    let tick = edit_tick(&state);
+                    let e = shed!{
+                        let Some(e) = ev.target() else {
+                            return;
+                        };
+                        let Ok(e) = e.dyn_into::<HtmlElement>() else {
+                            return;
+                        };
+                        e
+                    };
+                    let cell = find_containing_cell(&e).unwrap();
+                    let classes = cell.class_list();
+                    let xy = get_xy(&cell);
+                    *state.selected.borrow_mut() = Some((tick, cell.clone()));
+                    if xy.1 == Y(0) {
+                        state.selected_cell.set(pc, false);
+                        state.selected_th_or_cell.set(pc, true);
+                        state.selected_col_unpinned.set(pc, false);
+                    } else {
+                        state.selected_cell.set(pc, true);
+                        state.selected_th_or_cell.set(pc, true);
+                        state.selected_col_unpinned.set(pc, !classes.contains(CLASS_PIN_ROW));
+                    }
+                    state.selected_col_unpinned.set(pc, !classes.contains(CLASS_PIN_COL));
+                })
+            });
+            table.ref_on("focusout", {
+                let eg = pc.eg();
+                let state = state.clone();
+                move |ev| eg.event(|pc| {
+                    _ = edit_tick(&state);
+                    console::log_1(&JsValue::from(format!("(blur)")));
+                    let e = shed!{
+                        let Some(e) = ev.target() else {
+                            return;
+                        };
+                        let Ok(e) = e.dyn_into::<HtmlElement>() else {
+                            return;
+                        };
+                        e
+                    };
+                    let cell = find_containing_cell(&e).unwrap();
+                    stop_editing_cell(&cell);
+                    cell.dyn_ref::<HtmlElement>().unwrap().blur().unwrap();
+                    if Some(&cell) == state.selected.borrow().as_ref().map(|s| &s.1) {
+                        state.selected_cell.set(pc, false);
+                        state.selected_th_or_cell.set(pc, false);
+                        state.selected_col_unpinned.set(pc, false);
+                        state.selected_row_unpinned.set(pc, false);
+                        *state.selected.borrow_mut() = None;
+                    }
+                })
+            });
+
             // Add initial data
             apply(&state, Change::Splice(ChangeSplice {
                 start: (X(0), Y(0)),
@@ -1640,215 +1733,9 @@ pub fn create_editor(initial_data: Vec<serde_json::Value>) -> Result<El, String>
                 }).collect(),
                 add_rows: initial_add_rows,
             }));
-            select(pc, &state, Selection::Cell((X(0), Y(0))));
+            select(&state, (X(0), Y(0)));
 
-            // Event handling
-            table.ref_on("keypress", {
-                let eg = pc.eg();
-                let state = state.clone();
-                move |ev| eg.event(|pc| {
-                    let ev = ev.dyn_ref::<KeyboardEvent>().unwrap();
-                    console::log_1(
-                        &JsValue::from(
-                            format!("key event {}, alt {}, ctrl {}", ev.key(), ev.alt_key(), ev.ctrl_key()),
-                        ),
-                    );
-                    match state.selection.get() {
-                        Selection::Header(sel) => {
-                            match ev.key().as_str() {
-                                "ArrowDown" => {
-                                    select(pc, &state, Selection::Cell((sel, Y(0))));
-                                    ev.prevent_default();
-                                },
-                                _ => {
-                                    // nop
-                                },
-                            }
-                        },
-                        Selection::Cell(sel) => {
-                            if state.mode_edit_text.get() {
-                                match ev.key().as_str() {
-                                    "Escape" => {
-                                        stop_editing_cell(&state, sel);
-                                        ev.prevent_default();
-                                    },
-                                    _ => {
-                                        // nop
-                                    },
-                                }
-                            } else {
-                                match ev.key().as_str() {
-                                    "ArrowUp" => {
-                                        if ev.ctrl_key() {
-                                            act_add_up(pc, &state);
-                                            ev.prevent_default();
-                                        } else {
-                                            if sel.1 == Y(0) {
-                                                return;
-                                            }
-                                            select(pc, &state, Selection::Cell((sel.0, sel.1 - Y(1))));
-                                            ev.prevent_default();
-                                        }
-                                    },
-                                    "ArrowDown" => {
-                                        if ev.ctrl_key() {
-                                            act_add_down(pc, &state);
-                                            ev.prevent_default();
-                                        } else {
-                                            if sel.1 == row_count(&state) {
-                                                return;
-                                            }
-                                            select(pc, &state, Selection::Cell((sel.0, sel.1 + Y(1))));
-                                            ev.prevent_default();
-                                        }
-                                    },
-                                    "ArrowLeft" => {
-                                        if ev.ctrl_key() {
-                                            act_add_left(pc, &state);
-                                            ev.prevent_default();
-                                        } else {
-                                            if sel.0 == X(0) {
-                                                return;
-                                            }
-                                            select(pc, &state, Selection::Cell((sel.0 - X(1), sel.1)));
-                                            ev.prevent_default();
-                                        }
-                                    },
-                                    "ArrowRight" => {
-                                        if ev.ctrl_key() {
-                                            act_add_right(pc, &state);
-                                            ev.prevent_default();
-                                        } else {
-                                            if sel.0 == column_count(&state) {
-                                                return;
-                                            }
-                                            select(pc, &state, Selection::Cell((sel.0 + X(1), sel.1)));
-                                            ev.prevent_default();
-                                        }
-                                    },
-                                    "Enter" => {
-                                        start_editing_cell(pc, &state, sel);
-                                        ev.prevent_default();
-                                    },
-                                    _ => { },
-                                }
-                            }
-                        },
-                    }
-                })
-            });
-
-            fn find_cell(start: &Node) -> Option<Element> {
-                let mut at = start.clone();
-                loop {
-                    shed!{
-                        if at.node_type() != Node::ELEMENT_NODE {
-                            break;
-                        }
-                        let el = at.dyn_ref::<Element>().unwrap();
-                        let el_tag = el.tag_name().to_ascii_lowercase();
-                        if el_tag == "table" || el_tag == "tr" {
-                            return None;
-                        }
-                        if el_tag == "th" || el_tag == "td" {
-                            return Some(el.clone());
-                        }
-                    };
-                    let Some(at1) = at.parent_node() else {
-                        return None;
-                    };
-                    at = at1;
-                };
-            }
-
-            table.ref_on("click", {
-                let eg = pc.eg();
-                let state = state.clone();
-                move |ev| eg.event(|pc| {
-                    console::log_1(&JsValue::from(format!("Click")));
-                    let Some(cell) = find_cell(&ev.target().unwrap().dyn_into::<Node>().unwrap()) else {
-                        console::log_1(&JsValue::from(format!("No cell at click")));
-                        return;
-                    };
-                    superif!({
-                        let Some(active_element) = document().active_element() else {
-                            console::log_1(&JsValue::from(format!("No active el")));
-                            break 'unedit;
-                        };
-                        let x = X(index_in_parent(&cell) as i64);
-                        let y = Y(index_in_parent(&cell.parent_element().unwrap()) as i64) - Y(1);
-                        if active_element != cell {
-                            console::log_1(&JsValue::from(format!("Selected/active el different")));
-                            break 'unedit;
-                        }
-                        if !state.mode_edit_text.get() {
-                            console::log_1(&JsValue::from(format!("Start editing")));
-                            start_editing_cell(pc, &state, (x, y));
-                            ev.prevent_default();
-                        } else {
-                            console::log_1(&JsValue::from(format!("Already editing")));
-                        }
-                    } 'unedit {
-                        if state.mode_edit_text.get() {
-                            let x = X(index_in_parent(&cell) as i64);
-                            let y = Y(index_in_parent(&cell.parent_element().unwrap()) as i64) - Y(1);
-                            stop_editing_cell(&state, (x, y));
-                        } else {
-                            console::log_1(&JsValue::from(format!("Unedit, not editing")));
-                        }
-                    });
-                })
-            });
-
-            //.            table.ref_on("click", {
-            //.                let eg = pc.eg();
-            //.                let state = state.clone();
-            //.                move |ev| eg.event(|pc| {
-            //.                    // Find cell
-            //.                    let Some(cell) = find_cell(&ev.target().unwrap().dyn_into::<Node>().unwrap()) else {
-            //.                        return;
-            //.                    };
-            //. 
-            //.                    // Get coords
-            //.                    let x = X(index_in_parent(&cell) as i64);
-            //.                    let y = Y(index_in_parent(&cell.parent_element().unwrap()) as i64) - Y(1);
-            //.                    if y.0 < 0 {
-            //.                        let new_sel = Selection::Header(x);
-            //.                        if new_sel != state.selection.get() {
-            //.                            select(pc, &state, new_sel);
-            //.                        }
-            //.                        return;
-            //.                    }
-            //. 
-            //.                    // Select
-            //.                    let old_sel = state.selection.get();
-            //.                    if old_sel == Selection::Cell((x, y)) {
-            //.                        if !state.mode_edit_text.get() {
-            //.                            start_editing_cell(pc, &state, (x, y));
-            //.                            ev.prevent_default();
-            //.                        }
-            //.                    } else {
-            //.                        match old_sel {
-            //.                            Selection::Header(_) => {
-            //.                                shed!{
-            //.                                    let Some(e) = document().active_element() else {
-            //.                                        break;
-            //.                                    };
-            //.                                    let Ok(e) = e.dyn_into::<HtmlElement>() else {
-            //.                                        break;
-            //.                                    };
-            //.                                    e.blur().unwrap();
-            //.                                }
-            //.                            },
-            //.                            Selection::Cell(old_sel) => {
-            //.                                stop_editing_cell(&state, old_sel);
-            //.                            },
-            //.                        }
-            //.                        select(pc, &state, Selection::Cell((x, y)));
-            //.                        ev.prevent_default();
-            //.                    }
-            //.                })
-            //.            });
+            // Action event handling
             let text_obs;
             {
                 let eg = pc.eg();
@@ -1857,42 +1744,23 @@ pub fn create_editor(initial_data: Vec<serde_json::Value>) -> Result<El, String>
                     eg.event(|pc| {
                         for change in changes {
                             let change = change.dyn_into::<MutationRecord>().unwrap();
-                            let Some(cell) = find_cell(&change.target().unwrap().dyn_into::<Node>().unwrap()) else {
-                                continue;
-                            };
-                            let x = X(index_in_parent(&cell) as i64);
-                            let cell_tag = cell.tag_name().to_ascii_lowercase();
-                            if cell_tag == "th" {
-                                push_undo(pc, &state, Selection::Header(x), Change::ColumnTitle(ChangeColumnTitle {
-                                    coord: x,
-                                    title: cell.get_attribute(ATTR_TH_OLD_TEXT).unwrap(),
-                                }));
-                                cell.set_attribute(ATTR_TH_OLD_TEXT, &cell.text_content().unwrap()).unwrap();
-                            } else {
-                                let y = Y(index_in_parent(&cell.parent_element().unwrap()) as i64);
-                                push_undo(
-                                    pc,
-                                    &state,
-                                    Selection::Cell((x, y)),
-                                    Change::Cells(
-                                        ChangeCells {
-                                            cells: [
-                                                (
-                                                    (x, y),
-                                                    Value::from_str(
-                                                        &cell.get_attribute(ATTR_CELL_OLD_VALUE).unwrap(),
-                                                    ).unwrap(),
-                                                ),
-                                            ]
-                                                .into_iter()
-                                                .collect(),
-                                        },
-                                    ),
-                                );
-                                let new_value = get_value(&cell);
-                                cell.set_attribute(ATTR_CELL_OLD_VALUE, &new_value.to_string()).unwrap();
-                                validate_cell(&cell, &new_value);
-                            }
+                            let Some(cell) =
+                                find_containing_cell(&change.target().unwrap().dyn_into::<Node>().unwrap()) else {
+                                    continue;
+                                };
+                            let xy = get_xy(&cell);
+                            let cell_change;
+                            cell_change =
+                                Value::from_str(&cell.get_attribute(ATTR_TH_CELL_OLD_VALUE).unwrap()).unwrap();
+                            let new_value = get_value(&cell);
+                            cell.set_attribute(ATTR_TH_CELL_OLD_VALUE, &new_value.to_string()).unwrap();
+                            validate_cell(&cell, &new_value);
+                            push_undo(
+                                pc,
+                                &state,
+                                Some(xy),
+                                Change::Cells(ChangeCells { cells: [(xy, cell_change)].into_iter().collect() }),
+                            );
                         }
                     })
                 }) as Box<dyn Fn(Array, JsValue)>);
@@ -1905,6 +1773,155 @@ pub fn create_editor(initial_data: Vec<serde_json::Value>) -> Result<El, String>
                 o.set_subtree(true);
                 o
             }).unwrap();
+            table.ref_on_with_options("keydown", EventListenerOptions {
+                phase: EventListenerPhase::Bubble,
+                passive: false,
+            }, {
+                let eg = pc.eg();
+                let state = state.clone();
+                move |ev| eg.event(|pc| {
+                    edit_tick(&state);
+                    let ev = ev.dyn_ref::<KeyboardEvent>().unwrap();
+                    console::log_1(
+                        &JsValue::from(
+                            format!("key event {}, alt {}, ctrl {}", ev.key(), ev.alt_key(), ev.ctrl_key()),
+                        ),
+                    );
+                    if let Some(cell) = find_containing_cell(&ev.target().unwrap().dyn_into::<Node>().unwrap()) {
+                        let xy = get_xy(&cell);
+                        if cell.class_list().contains(CLASS_EDITING) {
+                            match ev.key().as_str() {
+                                "Escape" => {
+                                    stop_editing_cell(&cell);
+                                    ev.prevent_default();
+                                },
+                                _ => {
+                                    // nop
+                                },
+                            }
+                        } else {
+                            match ev.key().as_str() {
+                                "ArrowUp" => {
+                                    if ev.ctrl_key() && xy.1 >= Y(1) {
+                                        act_add_up(pc, &state);
+                                        ev.prevent_default();
+                                    } else {
+                                        if xy.1 == Y(0) {
+                                            console::log_1(&JsValue::from(format!("up, at 1 -> exit")));
+                                            return;
+                                        }
+                                        console::log_1(&JsValue::from(format!("up, sel up 0")));
+                                        select(&state, (xy.0, xy.1 - Y(1)));
+                                        ev.prevent_default();
+                                        console::log_1(&JsValue::from(format!("up, sel up")));
+                                    }
+                                },
+                                "ArrowDown" => {
+                                    if ev.ctrl_key() && xy.1 >= Y(1) {
+                                        act_add_down(pc, &state);
+                                        ev.prevent_default();
+                                    } else {
+                                        if xy.1 == row_count(&state) {
+                                            return;
+                                        }
+                                        select(&state, (xy.0, xy.1 + Y(1)));
+                                        ev.prevent_default();
+                                    }
+                                },
+                                "ArrowLeft" => {
+                                    if ev.ctrl_key() {
+                                        act_add_left(pc, &state);
+                                        ev.prevent_default();
+                                    } else {
+                                        if xy.0 == X(0) {
+                                            return;
+                                        }
+                                        select(&state, (xy.0 - X(1), xy.1));
+                                        ev.prevent_default();
+                                    }
+                                },
+                                "ArrowRight" => {
+                                    if ev.ctrl_key() {
+                                        act_add_right(pc, &state);
+                                        ev.prevent_default();
+                                    } else {
+                                        if xy.0 == column_count(&state) {
+                                            return;
+                                        }
+                                        select(&state, (xy.0 + X(1), xy.1));
+                                        ev.prevent_default();
+                                    }
+                                },
+                                "Enter" => {
+                                    start_editing_cell(pc, &state, &cell);
+                                    ev.prevent_default();
+                                },
+                                _ => { },
+                            }
+                        }
+                    }
+                })
+            });
+            table.ref_on_with_options("click", EventListenerOptions {
+                phase: EventListenerPhase::Bubble,
+                passive: false,
+            }, {
+                let eg = pc.eg();
+                let state = state.clone();
+                move |ev| eg.event(|pc| {
+                    let tick = edit_tick(&state);
+                    console::log_1(&JsValue::from(format!("Click")));
+                    let Some(cell) = find_containing_cell(&ev.target().unwrap().dyn_into::<Node>().unwrap()) else {
+                        console::log_1(&JsValue::from(format!("No cell at click")));
+                        return;
+                    };
+                    superif!({
+                        let Some(active_element) = document().active_element() else {
+                            console::log_1(&JsValue::from(format!("No active el")));
+                            break 'unedit;
+                        };
+                        if active_element != cell {
+                            console::log_1(&JsValue::from(format!("Selected/active el different")));
+                            break 'unedit;
+                        }
+                        let was_selected = superif!({
+                            let selected = state.selected.borrow();
+                            let Some((select_tick, select_el)) = selected.as_ref() else {
+                                break 'no;
+                            };
+                            if *select_tick == tick {
+                                break 'no;
+                            }
+                            if &cell != select_el {
+                                break 'no;
+                            }
+                            console::log_1(
+                                &JsValue::from(format!("Start editing - tick {} v {}", tick, *select_tick)),
+                            );
+                            break true;
+                        } 'no {
+                            break false;
+                        });
+                        if was_selected {
+                            if !cell.class_list().contains(CLASS_EDITING) {
+                                console::log_1(&JsValue::from(format!("Start editing")));
+                                start_editing_cell(pc, &state, &cell);
+                                ev.prevent_default();
+                            } else {
+                                console::log_1(&JsValue::from(format!("Already editing")));
+                            }
+                        } else {
+                            console::log_1(&JsValue::from(format!("Fresh selection")));
+                        }
+                    } 'unedit {
+                        if cell.class_list().contains(CLASS_EDITING) {
+                            stop_editing_cell(&cell);
+                        } else {
+                            console::log_1(&JsValue::from(format!("Unedit, not editing")));
+                        }
+                    });
+                })
+            });
         }
     });
     return Ok(root);
