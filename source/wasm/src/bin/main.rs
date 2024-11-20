@@ -102,8 +102,10 @@ static ICON_TYPE_NUMBER: &str = "type_number";
 static ICON_TYPE_NULL: &str = "type_null";
 static ICON_TYPE_MISSING: &str = "type_missing";
 static ICON_TYPE_JSON: &str = "type_null";
+static CLASS_ROOT: &str = "sheetman";
 static CLASS_DISABLED: &str = "disabled";
 static CLASS_INVALID: &str = "invalid";
+static CLASS_SELECTED: &str = "selected";
 static CLASS_EDITING: &str = "editing";
 static CLASS_PIN_COL: &str = "pin_coll";
 static CLASS_PIN_ROW: &str = "pin_row";
@@ -428,7 +430,7 @@ fn find_containing_cell(start: &Node) -> Option<Element> {
     };
 }
 
-fn apply(state: &State, change: Change) -> (Option<Coord2>, Change) {
+fn apply(state: &Rc<State>, change: Change) -> (Option<Coord2>, Change) {
     match change {
         Change::Cells(change) => {
             let mut out = HashMap::new();
@@ -451,7 +453,7 @@ fn apply(state: &State, change: Change) -> (Option<Coord2>, Change) {
             let parent = state.table_thr.raw().parent_element().unwrap();
             let children = parent.children();
             let rev_change_remove = (X(change.add_columns.len() as i64), Y(change.add_rows.len() as i64));
-            let old_selection = find_selection().map(|s| s.0);
+            let old_selection = find_selection(state).map(|s| s.0);
 
             // Remove rows
             let mut rev_add_rows = vec![];
@@ -807,19 +809,16 @@ fn get_xy(cell: &Element) -> Coord2 {
     return (X(index_in_parent(&cell) as i64), Y(index_in_parent(&cell.parent_element().unwrap()) as i64));
 }
 
-fn find_selection() -> Option<(Coord2, Element)> {
-    // TODO make sure in current table
-    let Some(active) = document().active_element() else {
-        return None;
-    };
-    let Some(cell) = find_containing_cell(&active) else {
+fn find_selection(state: &Rc<State>) -> Option<(Coord2, Element)> {
+    let selected = state.table_thr.raw().parent_element().unwrap().get_elements_by_class_name(CLASS_SELECTED);
+    let Some(cell) = selected.item(0) else {
         return None;
     };
     return Some((get_xy(&cell), cell));
 }
 
 fn act_add_left(pc: &mut ProcessingContext, state: &Rc<State>) {
-    let Some((sel_xy, _)) = find_selection() else {
+    let Some((sel_xy, _)) = find_selection(state) else {
         return;
     };
     let change = Change::Splice(ChangeSplice {
@@ -838,7 +837,7 @@ fn act_add_left(pc: &mut ProcessingContext, state: &Rc<State>) {
 }
 
 fn act_add_right(pc: &mut ProcessingContext, state: &Rc<State>) {
-    let Some((sel_xy, _)) = find_selection() else {
+    let Some((sel_xy, _)) = find_selection(state) else {
         return;
     };
     let change = Change::Splice(ChangeSplice {
@@ -857,7 +856,7 @@ fn act_add_right(pc: &mut ProcessingContext, state: &Rc<State>) {
 }
 
 fn act_add_up(pc: &mut ProcessingContext, state: &Rc<State>) {
-    let Some((sel_xy, _)) = find_selection() else {
+    let Some((sel_xy, _)) = find_selection(state) else {
         return;
     };
     if sel_xy.1 == Y(0) {
@@ -880,7 +879,7 @@ fn act_add_up(pc: &mut ProcessingContext, state: &Rc<State>) {
 }
 
 fn act_add_down(pc: &mut ProcessingContext, state: &Rc<State>) {
-    let Some((sel_xy, _)) = find_selection() else {
+    let Some((sel_xy, _)) = find_selection(state) else {
         return;
     };
     if sel_xy.1 == Y(0) {
@@ -906,7 +905,7 @@ fn act_undo(pc: &mut ProcessingContext, state: &Rc<State>) {
     flush_undo(pc, &state);
     if let Some(mut level) = state.undo.borrow_mut().pop() {
         let mut rev_level = ChangeLevel {
-            selection: find_selection().map(|s| s.0),
+            selection: find_selection(state).map(|s| s.0),
             changes: vec![],
         };
         let mut last_apply_sel = None;
@@ -930,7 +929,7 @@ fn act_redo(pc: &mut ProcessingContext, state: &Rc<State>) {
     flush_undo(pc, &state);
     if let Some(mut level) = state.redo.borrow_mut().pop() {
         let mut rev_level = ChangeLevel {
-            selection: find_selection().map(|s| s.0),
+            selection: find_selection(state).map(|s| s.0),
             changes: vec![],
         };
         let mut last_apply_sel = None;
@@ -963,7 +962,7 @@ fn build_toolbar_sheet(pc: &mut ProcessingContext, state: &Rc<State>, button: &E
                     }],
                     add_rows: vec![],
                 }));
-                push_undo(pc, &state, find_selection().map(|s| s.0), rev_change);
+                push_undo(pc, &state, find_selection(&state).map(|s| s.0), rev_change);
                 if let Some(new_sel) = new_sel {
                     select(&state, new_sel);
                 }
@@ -993,7 +992,7 @@ fn build_toolbar_column(pc: &mut ProcessingContext, state: &Rc<State>, button: &
             {
                 let state = state.clone();
                 move |pc, e| {
-                    let Some((sel_xy, _)) = find_selection() else {
+                    let Some((sel_xy, _)) = find_selection(&state) else {
                         return;
                     };
                     let mut cells = get_column(&state, sel_xy.0).into_iter();
@@ -1051,7 +1050,7 @@ fn build_toolbar_column(pc: &mut ProcessingContext, state: &Rc<State>, button: &
         el_toolbar_button(pc, "Delete", ICON_DELETE, &state.always, {
             let state = state.clone();
             move |pc, _| {
-                let Some((sel_xy, _)) = find_selection() else {
+                let Some((sel_xy, _)) = find_selection(&state) else {
                     return;
                 };
                 let col_count = column_count(&state);
@@ -1080,7 +1079,7 @@ fn build_toolbar_column(pc: &mut ProcessingContext, state: &Rc<State>, button: &
         el_toolbar_button(pc, "Sort", ICON_SORT, &state.always, {
             let state = state.clone();
             move |pc, _| {
-                let Some((sel_xy, _)) = find_selection() else {
+                let Some((sel_xy, _)) = find_selection(&state) else {
                     return;
                 };
                 let mut rows1 = vec![];
@@ -1109,7 +1108,7 @@ fn build_toolbar_column(pc: &mut ProcessingContext, state: &Rc<State>, button: &
         el_toolbar_button(pc, "Sort reverse", ICON_SORT_REV, &state.always, {
             let state = state.clone();
             move |pc, _| {
-                let Some((sel_xy, _)) = find_selection() else {
+                let Some((sel_xy, _)) = find_selection(&state) else {
                     return;
                 };
                 let mut rows1 = vec![];
@@ -1151,7 +1150,7 @@ fn build_toolbar_row(pc: &mut ProcessingContext, state: &Rc<State>, button: &El,
             {
                 let state = state.clone();
                 move |pc, e| {
-                    let Some((sel_xy, _)) = find_selection() else {
+                    let Some((sel_xy, _)) = find_selection(&state) else {
                         return;
                     };
                     let mut cells = get_row(&state, sel_xy.1).into_iter();
@@ -1209,7 +1208,7 @@ fn build_toolbar_row(pc: &mut ProcessingContext, state: &Rc<State>, button: &El,
         el_toolbar_button(pc, "Delete", ICON_DELETE, &state.selected_cell, {
             let state = state.clone();
             move |pc, _| {
-                let Some((sel_xy, _)) = find_selection() else {
+                let Some((sel_xy, _)) = find_selection(&state) else {
                     return;
                 };
                 let change = Change::Splice(ChangeSplice {
@@ -1230,7 +1229,7 @@ fn build_toolbar_row(pc: &mut ProcessingContext, state: &Rc<State>, button: &El,
         el_toolbar_button(pc, "Shift up", ICON_SHIFT_UP, &state.selected_cell, {
             let state = state.clone();
             move |pc, _| {
-                let Some((sel_xy, _)) = find_selection() else {
+                let Some((sel_xy, _)) = find_selection(&state) else {
                     return;
                 };
                 if sel_xy.1 <= Y(1) {
@@ -1262,7 +1261,7 @@ fn build_toolbar_row(pc: &mut ProcessingContext, state: &Rc<State>, button: &El,
         el_toolbar_button(pc, "Shift down", ICON_SHIFT_DOWN, &state.selected_cell, {
             let state = state.clone();
             move |pc, _| {
-                let Some((sel_xy, _)) = find_selection() else {
+                let Some((sel_xy, _)) = find_selection(&state) else {
                     return;
                 };
                 if sel_xy.1 == row_count(&state) {
@@ -1302,7 +1301,7 @@ fn build_toolbar_cell(pc: &mut ProcessingContext, state: &Rc<State>, button: &El
         el_toolbar_button(pc, "String", ICON_TYPE_STRING, &state.selected_cell, {
             let state = state.clone();
             move |pc, _| {
-                let Some((sel_xy, sel)) = find_selection() else {
+                let Some((sel_xy, sel)) = find_selection(&state) else {
                     return;
                 };
                 if sel_xy.1 == Y(0) {
@@ -1340,7 +1339,7 @@ fn build_toolbar_cell(pc: &mut ProcessingContext, state: &Rc<State>, button: &El
         el_toolbar_button(pc, "Number", ICON_TYPE_NUMBER, &state.selected_cell, {
             let state = state.clone();
             move |pc, _| {
-                let Some((sel_xy, sel)) = find_selection() else {
+                let Some((sel_xy, sel)) = find_selection(&state) else {
                     return;
                 };
                 if sel_xy.1 == Y(0) {
@@ -1384,7 +1383,7 @@ fn build_toolbar_cell(pc: &mut ProcessingContext, state: &Rc<State>, button: &El
         el_toolbar_button(pc, "Bool", ICON_TYPE_BOOL, &state.selected_cell, {
             let state = state.clone();
             move |pc, _| {
-                let Some((sel_xy, sel)) = find_selection() else {
+                let Some((sel_xy, sel)) = find_selection(&state) else {
                     return;
                 };
                 if sel_xy.1 == Y(0) {
@@ -1428,7 +1427,7 @@ fn build_toolbar_cell(pc: &mut ProcessingContext, state: &Rc<State>, button: &El
         el_toolbar_button(pc, "Json", ICON_TYPE_JSON, &state.selected_cell, {
             let state = state.clone();
             move |pc, _| {
-                let Some((sel_xy, sel)) = find_selection() else {
+                let Some((sel_xy, sel)) = find_selection(&state) else {
                     return;
                 };
                 if sel_xy.1 == Y(0) {
@@ -1456,7 +1455,7 @@ fn build_toolbar_cell(pc: &mut ProcessingContext, state: &Rc<State>, button: &El
         el_toolbar_button(pc, "Null", ICON_TYPE_NULL, &state.selected_cell, {
             let state = state.clone();
             move |pc, _| {
-                let Some((sel_xy, _)) = find_selection() else {
+                let Some((sel_xy, _)) = find_selection(&state) else {
                     return;
                 };
                 if sel_xy.1 == Y(0) {
@@ -1477,7 +1476,7 @@ fn build_toolbar_cell(pc: &mut ProcessingContext, state: &Rc<State>, button: &El
         el_toolbar_button(pc, "Missing", ICON_TYPE_MISSING, &state.selected_cell, {
             let state = state.clone();
             move |pc, _| {
-                let Some((sel_xy, _)) = find_selection() else {
+                let Some((sel_xy, _)) = find_selection(&state) else {
                     return;
                 };
                 if sel_xy.1 == Y(0) {
@@ -1563,7 +1562,7 @@ pub fn create_editor(initial_data: Vec<serde_json::Value>) -> Result<El, String>
 
     // Construct
     let eg = EventGraph::new();
-    let root = el("div");
+    let root = el("div").classes(&[CLASS_ROOT]);
     eg.event({
         let root = root.clone();
         move |pc| {
@@ -1681,6 +1680,7 @@ pub fn create_editor(initial_data: Vec<serde_json::Value>) -> Result<El, String>
                     };
                     let cell = find_containing_cell(&e).unwrap();
                     let classes = cell.class_list();
+                    classes.add_1(CLASS_SELECTED).unwrap();
                     let xy = get_xy(&cell);
                     *state.selected.borrow_mut() = Some((tick, cell.clone()));
                     if xy.1 == Y(0) {
@@ -1711,6 +1711,7 @@ pub fn create_editor(initial_data: Vec<serde_json::Value>) -> Result<El, String>
                         e
                     };
                     let cell = find_containing_cell(&e).unwrap();
+                    cell.class_list().remove_1(CLASS_SELECTED).unwrap();
                     stop_editing_cell(&cell);
                     cell.dyn_ref::<HtmlElement>().unwrap().blur().unwrap();
                     if Some(&cell) == state.selected.borrow().as_ref().map(|s| &s.1) {
