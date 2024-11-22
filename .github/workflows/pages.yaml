@@ -14,13 +14,27 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      - name: install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
       - run: cargo install -f wasm-bindgen-cli --version 0.2.95
-      - run: rustup target add wasm32-unknown-unknown
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            ./source/native
+            ./source/wasm
+
       - run: cd source/native && cargo run build
+
       - id: pages
         uses: actions/configure-pages@v5
+
       - uses: actions/upload-pages-artifact@v3
         with:
           path: ./stage/web/static
+
       - id: deployment
         uses: actions/deploy-pages@v4
