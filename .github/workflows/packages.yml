@@ -1,21 +1,20 @@
-name: "packages"
-
 on:
   push:
     branches:
       - master
-
+permissions:
+  contents: write
+concurrency:
+  group: "packages"
+  cancel-in-progress: true
 jobs:
-  publish-tauri:
-    permissions:
-      contents: write
+  build:
     strategy:
       fail-fast: false
       matrix:
         include:
           - platform: "ubuntu-22.04"
             args: ""
-
     runs-on: ${{ matrix.platform }}
     steps:
       - uses: actions/checkout@v4
@@ -29,8 +28,7 @@ jobs:
       - name: install Rust stable
         uses: dtolnay/rust-toolchain@stable
         with:
-          # Those targets are only used on macos runners so it's in an `if` to slightly speed up windows and linux builds.
-          targets: ${{ matrix.platform == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+          targets: "wasm32-unknown-unknown"
 
       - uses: jetli/trunk-action@v0.5.0
 
