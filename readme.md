@@ -12,7 +12,7 @@ Why JSV? Pretty-printed it works with line-based diff and it's better specified 
 
 # Try it out
 
-Online, at <https://andrewbaxter.github.com/sheetman>
+Online, at <https://andrewbaxter.github.io/sheetman/>
 
 Offline, see the releases for desktop builds (Linux AppImage, Windows)
 
