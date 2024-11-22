@@ -1,0 +1,30 @@
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html {
+  height: 100%;
+}
+
+body {
+  display: grid;
+  grid-template-columns: 1fr;
+  height: 100%;
+}
+
+div.sheetman {
+  & .head {
+    position: relative;
+
+    &:before {
+      display: none !important;
+    }
+  }
+
+  & .toolbar_tabs,
+  & .toolbar {
+    padding-left: 0cm !important;
+  }
+}

@@ -7,3 +7,13 @@
 html {
   height: 100%;
 }
+
+body {
+  display: grid;
+  grid-template-columns: 1fr;
+  height: 100%;
+}
+
+.hidden {
+  display: none;
+}
