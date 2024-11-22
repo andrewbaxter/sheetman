@@ -8,6 +8,7 @@ use {
     wasm::{
         create_editor,
         dom::{
+            ICON_OPEN,
             ICON_SAVE,
             ICON_SAVEAS,
         },
@@ -43,6 +44,21 @@ fn main() {
         set_root(vec![create_editor(EditorOptions {
             sheet_actions: vec![
                 //. .
+                EditorAction {
+                    text: "Open".to_string(),
+                    icon: ICON_OPEN.to_string(),
+                    hotkeys: vec![Hotkey {
+                        key: "o".to_string(),
+                        ctrl: true,
+                        alt: false,
+                    }],
+                    cb: Rc::new(RefCell::new(Box::new(|editor| {
+                        spawn_local(async move {
+                            let data = invoke_without_args("command_open").await;
+                            editor.set_data(data.into_serde().unwrap()).unwrap();
+                        });
+                    }))),
+                },
                 EditorAction {
                     text: "Save".to_string(),
                     icon: ICON_SAVE.to_string(),

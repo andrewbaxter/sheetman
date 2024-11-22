@@ -17,7 +17,6 @@ use {
 
 #[derive(Aargvark)]
 struct Args {
-    /// File to edit, otherwise defaults to `sheet.jsv` in the current directory.
     file: PathBuf,
 }
 
@@ -26,11 +25,12 @@ fn main() -> Result<(), String> {
         let args = aargvark::vark::<Args>();
         let initial_data;
         match read(&args.file) {
-            Err(e) if e.kind() == ErrorKind::NotFound => {
-                initial_data = default_data();
-            },
             Err(e) => {
-                return Err(format!("Failed to read file [{}]: {}", args.file.to_string_lossy(), e));
+                if e.kind() == ErrorKind::NotFound {
+                    initial_data = default_data();
+                } else {
+                    return Err(format!("Failed to read file [{}]: {}", args.file.to_string_lossy(), e));
+                }
             },
             Ok(raw_data) => {
                 match args.file.extension().map(|x| x.as_bytes()) {

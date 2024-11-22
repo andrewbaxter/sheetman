@@ -49,15 +49,24 @@ pub(crate) struct ChangeCells {
 }
 
 #[derive(Clone)]
+pub(crate) struct ChangeSpliceRowCol {
+    pub(crate) pinned: bool,
+    pub(crate) cells: Vec<Value>,
+}
+
+#[derive(Clone)]
 pub(crate) struct ChangeSplice {
     pub(crate) start: Coord2,
     pub(crate) remove: Coord2,
     /// Each element is a column, with entries for all rows not including added rows.
     /// i.e. This can't have more elements than there are rows remaining after removal
     /// (+1 for heading).
-    pub(crate) add_columns: Vec<Vec<Value>>,
+    ///
+    /// There's one exception: in an empty table, a set of columns with 1 value each
+    /// (header) is allowed. This is done automatically once at startup and only them.
+    pub(crate) add_columns: Vec<ChangeSpliceRowCol>,
     /// Each element is a row, with entries for all columns including added columns
-    pub(crate) add_rows: Vec<Vec<Value>>,
+    pub(crate) add_rows: Vec<ChangeSpliceRowCol>,
 }
 
 #[derive(Clone)]

@@ -1,14 +1,17 @@
 use {
-    crate::dom::{
-        ATTR_TH_CELL_OLD_VALUE,
-        ATTR_VALUE_TYPE,
-        ATTR_VALUE_TYPE_BOOL,
-        ATTR_VALUE_TYPE_JSON,
-        ATTR_VALUE_TYPE_MISSING,
-        ATTR_VALUE_TYPE_NULL,
-        ATTR_VALUE_TYPE_NUMBER,
-        ATTR_VALUE_TYPE_STR,
-        CLASS_INVALID,
+    crate::{
+        dom::{
+            ATTR_TH_CELL_OLD_VALUE,
+            ATTR_VALUE_TYPE,
+            ATTR_VALUE_TYPE_BOOL,
+            ATTR_VALUE_TYPE_JSON,
+            ATTR_VALUE_TYPE_MISSING,
+            ATTR_VALUE_TYPE_NULL,
+            ATTR_VALUE_TYPE_NUMBER,
+            ATTR_VALUE_TYPE_STR,
+            CLASS_INVALID,
+        },
+        unit::Y,
     },
     serde::{
         Deserialize,
@@ -133,7 +136,7 @@ pub(crate) fn v_str(v: impl AsRef<str>) -> Value {
     };
 }
 
-pub(crate) fn apply_cell_value(cell: &Element, new_value: &Value) {
+pub(crate) fn apply_cell_value(cell: &Element, y: Y, new_value: &Value) {
     cell.set_text_content(Some(&new_value.string));
     cell.set_attribute(ATTR_VALUE_TYPE, match new_value.type_ {
         ValueType::String => ATTR_VALUE_TYPE_STR,
@@ -144,32 +147,36 @@ pub(crate) fn apply_cell_value(cell: &Element, new_value: &Value) {
         ValueType::Missing => ATTR_VALUE_TYPE_MISSING,
     }).unwrap();
     cell.set_attribute(ATTR_TH_CELL_OLD_VALUE, &new_value.to_string()).unwrap();
-    validate_cell(cell, &new_value);
+    validate_cell(cell, y, &new_value);
 }
 
-pub(crate) fn validate_cell(cell: &Element, v: &Value) {
+pub(crate) fn validate_cell(cell: &Element, y: Y, v: &Value) {
     let ok;
-    match v.type_ {
-        ValueType::String => ok = true,
-        ValueType::Bool => {
-            if v.string == STR_TRUE || v.string == STR_FALSE {
-                ok = true;
-            } else {
-                ok = false;
-            }
-        },
-        ValueType::Number => {
-            ok = v.string.parse::<f64>().is_ok();
-        },
-        ValueType::Json => {
-            ok = serde_json::from_str::<serde_json::Value>(&v.string).is_ok();
-        },
-        ValueType::Null => {
-            ok = v.string.is_empty();
-        },
-        ValueType::Missing => {
-            ok = v.string.is_empty();
-        },
+    if y == Y(0) {
+        ok = !v.string.is_empty();
+    } else {
+        match v.type_ {
+            ValueType::String => ok = true,
+            ValueType::Bool => {
+                if v.string == STR_TRUE || v.string == STR_FALSE {
+                    ok = true;
+                } else {
+                    ok = false;
+                }
+            },
+            ValueType::Number => {
+                ok = v.string.parse::<f64>().is_ok();
+            },
+            ValueType::Json => {
+                ok = serde_json::from_str::<serde_json::Value>(&v.string).is_ok();
+            },
+            ValueType::Null => {
+                ok = v.string.is_empty();
+            },
+            ValueType::Missing => {
+                ok = v.string.is_empty();
+            },
+        }
     }
     cell.class_list().toggle_with_force(CLASS_INVALID, !ok).unwrap();
 }

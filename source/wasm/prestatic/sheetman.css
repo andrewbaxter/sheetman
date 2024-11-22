@@ -5,6 +5,8 @@ div.sheetman {
   --c-fg2: black;
   --c-fg2-disabled: #737373;
   --c-bg3: #ffffff;
+  --c-bg-pin-th: rgb(133, 133, 197);
+  --c-bg-pin-cell: rgb(190, 190, 228);
   --c-grid: #c0c0c0;
   --c-select: #8797c0;
   --c-select-edit: #39c558;
@@ -12,7 +14,7 @@ div.sheetman {
   --c-fg-number: #193489;
   --c-fg-json: #6e1b87;
   --c-fg-bool: #b24a16;
-  --c-fg-invalid: red;
+  --c-bg-invalid: rgb(226, 166, 166);
   --s-radius: 0.05cm;
   --s-thin: 0.04cm;
   font-family: sans-serif;
@@ -121,15 +123,13 @@ div.sheetman {
   }
 
   & .table_container {
-    padding-left: 0.2cm;
-    padding-right: 0.2cm;
-    padding-bottom: 0.2cm;
     overflow-x: auto;
     overflow-y: auto;
     display: grid;
     grid-template-columns: 1fr;
-    justify-items: center;
-    align-items: center;
+    justify-items: start;
+    align-items: start;
+    flex-grow: 1;
 
     & table {
       border-spacing: 0;
@@ -153,6 +153,16 @@ div.sheetman {
     height: calc(1em + var(--s-pad) * 2);
     position: relative;
 
+    &.pin_col,
+    &.pin_row {
+      position: sticky;
+      z-index: 1;
+    }
+
+    &.pin_col.pin_row {
+      z-index: 2;
+    }
+
     &:focus {
       outline: none;
     }
@@ -173,8 +183,8 @@ div.sheetman {
       border-color: var(--c-select-edit);
     }
 
-    & .invalid {
-      color: var(--c-fg-invalid) !important;
+    &.invalid {
+      background-color: var(--c-bg-invalid) !important;
     }
 
     &[sheetman_type="null"]:after {
@@ -208,12 +218,29 @@ div.sheetman {
     }
   }
 
-  & td {
-    background-color: var(--c-bg3);
-  }
-
   & th[contenteditable],
   td[contenteditable] {
     user-select: revert;
+  }
+
+  & th {
+    top: 0px;
+    position: sticky;
+    background-color: var(--c-bg2);
+    z-index: 1;
+
+    &.pin_col {
+      background-color: var(--c-bg-pin-th);
+      z-index: 2;
+    }
+  }
+
+  & td {
+    background-color: var(--c-bg3);
+
+    &.pin_col,
+    &.pin_row {
+      background-color: var(--c-bg-pin-cell);
+    }
   }
 }

@@ -8,6 +8,7 @@ use {
         Change,
         ChangeCells,
         ChangeSplice,
+        ChangeSpliceRowCol,
         ChangeState,
     },
     dom::{
@@ -15,8 +16,6 @@ use {
         ATTR_CONTENTEDITABLE_PLAINTEXT,
         ATTR_TABINDEX,
         ATTR_TH_CELL_OLD_VALUE,
-        CLASS_BUTTON_PIN,
-        CLASS_BUTTON_UNPIN,
         CLASS_DISABLED,
         CLASS_EDITING,
         CLASS_HEAD,
@@ -106,6 +105,7 @@ use {
     },
     web_sys::{
         Element,
+        FocusOptions,
         HtmlElement,
         KeyboardEvent,
         MutationObserver,
@@ -140,20 +140,157 @@ struct State {
     selected_cell_not_missing: ObsBool,
     pin_resize_observer: OnceCell<ResizeObserver>,
     change: ChangeState,
+    pinned_cols: RefCell<BTreeSet<X>>,
+    pinned_rows: RefCell<BTreeSet<Y>>,
     hotkeys: HashMap<Hotkey, Rc<RefCell<Box<dyn FnMut(Editor)>>>>,
 }
 
-fn build_th(title: &Value) -> Element {
+fn update_cell_pin(state: &Rc<State>, cell: &Element, col: bool, row: bool) {
+    let classes = cell.class_list();
+    classes.toggle_with_force(CLASS_PIN_COL, col).unwrap();
+    classes.toggle_with_force(CLASS_PIN_ROW, row).unwrap();
+    if col || row {
+        let obs_opts = ResizeObserverOptions::new();
+        obs_opts.set_box(ResizeObserverBoxOptions::BorderBox);
+        state.pin_resize_observer.get().unwrap().0.js_resize_observer.observe_with_options(&cell, &obs_opts);
+    } else {
+        state.pin_resize_observer.get().unwrap().0.js_resize_observer.unobserve(&cell);
+    }
+}
+
+fn maybe_pin_cell(
+    state: &Rc<State>,
+    xy: Coord2,
+    pinned_cols: &BTreeSet<X>,
+    pinned_rows: &BTreeSet<Y>,
+    cell: &Element,
+) {
+    let pinned_col = pinned_cols.contains(&xy.0);
+    let pinned_row = pinned_rows.contains(&xy.1);
+    if pinned_col || pinned_row {
+        update_cell_pin(state, cell, pinned_col, pinned_row);
+    }
+}
+
+fn update_column_pin_offsets(state: &Rc<State>) {
+    let rows = state.tbody.raw().children();
+
+    #[derive(Clone)]
+    struct PinCol {
+        width: f64,
+        cells: Vec<HtmlElement>,
+    }
+
+    let mut pin_cols = vec![];
+    let pinned = state.pinned_cols.borrow();
+    pin_cols.resize(pinned.len(), PinCol {
+        width: 0.,
+        cells: vec![],
+    });
+    let mut start_left = 0.;
+    let grid_border_thickness = 1.;
+    for rel_y in 0 .. rows.length() {
+        let row = rows.item(rel_y).unwrap().children();
+        for (x, pin_col) in Iterator::zip(pinned.iter(), pin_cols.iter_mut()) {
+            let cell = row.item(x.0 as u32).unwrap().dyn_into::<HtmlElement>().unwrap();
+            if rel_y == 0 {
+                pin_col.width = cell.get_bounding_client_rect().width();
+                if *x > X(0) {
+                    start_left += grid_border_thickness + pin_col.width;
+                }
+            }
+            pin_col.cells.push(cell);
+        }
+    }
+    let mut prev_right = 0.;
+    let mut prev_left = start_left;
+    for (rel_x, pin_col) in pin_cols.into_iter().enumerate() {
+        if rel_x > 0 {
+            prev_left -= grid_border_thickness + pin_col.width;
+        }
+        for cell in &pin_col.cells {
+            cell.style().set_property("left", &format!("{}px", prev_right)).unwrap();
+            cell.style().set_property("right", &format!("{}px", prev_left)).unwrap();
+        }
+        prev_right += grid_border_thickness + pin_col.width;
+    }
+}
+
+fn update_row_pin_offsets(state: &Rc<State>) {
+    let rows = state.tbody.raw().children();
+
+    #[derive(Clone)]
+    struct PinRow {
+        height: f64,
+        cells: Vec<HtmlElement>,
+    }
+
+    let mut pin_rows = vec![];
+    let pinned = state.pinned_rows.borrow();
+    pin_rows.resize(pinned.len() + 1, PinRow {
+        height: 0.,
+        cells: vec![],
+    });
+    let mut sum_height = 0.;
+    let grid_border_thickness = 1.;
+    for (y, pin_row) in Iterator::zip(Iterator::chain(
+        // Include header row - header row should never be pinned due to guards
+        [Y(0)].iter(),
+        // Plus other rows
+        pinned.iter(),
+    ), pin_rows.iter_mut()) {
+        let row = rows.item(y.0 as u32).unwrap().children();
+        for rel_x in 0 .. row.length() {
+            let cell = row.item(rel_x).unwrap().dyn_into::<HtmlElement>().unwrap();
+            if rel_x == 0 {
+                pin_row.height = cell.get_bounding_client_rect().height();
+                if *y > Y(0) {
+                    sum_height += grid_border_thickness;
+                    sum_height += pin_row.height;
+                }
+            }
+            pin_row.cells.push(cell);
+        }
+    }
+    let mut prev_bottom = 0.;
+    let mut prev_top = sum_height;
+    for (rel_y, pin_row) in pin_rows.into_iter().enumerate() {
+        if rel_y > 0 {
+            prev_top -= grid_border_thickness + pin_row.height;
+        }
+        for cell in &pin_row.cells {
+            cell.style().set_property("top", &format!("{}px", prev_bottom)).unwrap();
+            cell.style().set_property("bottom", &format!("{}px", prev_top)).unwrap();
+        }
+        prev_bottom += grid_border_thickness + pin_row.height;
+    }
+}
+
+fn build_th(
+    state: &Rc<State>,
+    xy: Coord2,
+    pinned_cols: &BTreeSet<X>,
+    pinned_rows: &BTreeSet<Y>,
+    title: &Value,
+) -> Element {
     let out = document().create_element("th").unwrap();
     out.set_attribute(ATTR_TABINDEX, "0").unwrap();
-    apply_cell_value(&out, title);
+    apply_cell_value(&out, xy.1, title);
+    maybe_pin_cell(state, xy, pinned_cols, pinned_rows, &out);
     return out;
 }
 
-fn build_cell(new_value: &Value) -> Element {
+fn build_cell(
+    state: &Rc<State>,
+    xy: Coord2,
+    pinned_cols: &BTreeSet<X>,
+    pinned_rows: &BTreeSet<Y>,
+    new_value: &Value,
+) -> Element {
     let out = document().create_element("td").unwrap();
     out.set_attribute(ATTR_TABINDEX, "0").unwrap();
-    apply_cell_value(&out, new_value);
+    apply_cell_value(&out, xy.1, new_value);
+    maybe_pin_cell(state, xy, pinned_cols, pinned_rows, &out);
     return out;
 }
 
@@ -191,10 +328,10 @@ fn apply(state: &Rc<State>, change: Change) -> (Option<Coord2>, Change) {
                         panic!();
                     }
                     out.insert(xy, v_str(&cell.text_content().unwrap()));
-                    apply_cell_value(&cell, &new_value);
+                    apply_cell_value(&cell, xy.1, &new_value);
                 } else {
                     out.insert(xy, get_value(&cell));
-                    apply_cell_value(&cell, &new_value);
+                    apply_cell_value(&cell, xy.1, &new_value);
                 }
             }
             return (None, Change::Cells(ChangeCells { cells: out }));
@@ -204,73 +341,148 @@ fn apply(state: &Rc<State>, change: Change) -> (Option<Coord2>, Change) {
             let rows = rows_parent.children();
             let rev_change_remove = (X(change.add_columns.len() as i64), Y(change.add_rows.len() as i64));
             let old_selection = find_selection(state).map(|s| s.0);
-            let initial_column_count = column_count(state);
+            let initial_column_count = table_width(state);
             let initial_row_count = Y(rows.length() as i64);
 
             // Remove rows
+            let mut pinned_rows = state.pinned_rows.borrow_mut();
             let mut rev_add_rows = vec![];
-            for _ in change.start.1.0 .. change.remove.1.0 {
+            for rel_y in 0 .. change.remove.1.0 {
+                let y = change.start.1 + Y(rel_y);
                 let row = rows.item(change.start.1.0 as u32).unwrap();
                 let row_children = row.children();
+
+                // Add removed row to reverse change
                 let mut rev_add_row = vec![];
-                for i in 0 .. row_children.length() {
-                    rev_add_row.push(get_value(&row_children.item(i).unwrap()));
+                for rel_x in 0 .. row_children.length() {
+                    rev_add_row.push(get_value(&row_children.item(rel_x).unwrap()));
                 }
+                rev_add_rows.push(ChangeSpliceRowCol {
+                    pinned: pinned_rows.contains(&y),
+                    cells: rev_add_row,
+                });
+
+                // Remove it
                 row.remove();
-                rev_add_rows.push(rev_add_row);
             }
-
-            // .
-            let mut rev_add_columns = vec![];
-            for _ in 0 .. change.remove.0.0 {
-                rev_add_columns.push(vec![]);
-            }
-            for y in 0 .. rows.length() {
-                let row = rows.item(y).unwrap();
-                let cells = row.children();
-
-                // Remove columns
-                for i in 0 .. change.remove.0.0 {
-                    let cell = cells.item(change.start.0.0 as u32).unwrap();
-                    rev_add_columns.get_mut(i as usize).unwrap().push(get_value(&cell));
-                    cell.remove();
-                }
-
-                // Add new columns
-                let add_cells_before = cells.item(change.start.0.0 as u32).map(|v| v.dyn_into::<Node>().unwrap());
-                for col_values in &change.add_columns {
-                    let cell_value = col_values.get(y as usize).unwrap();
-                    let cell;
-                    if y == 0 {
-                        cell = build_th(&cell_value);
-                    } else {
-                        cell = build_cell(&cell_value);
+            {
+                // Shift row pins by row remove + add
+                let adjust_y = Y(0) - change.remove.1 + Y(change.add_rows.len() as i64);
+                for k in pinned_rows.split_off(&change.start.1) {
+                    if k < change.start.1 + change.remove.1 {
+                        continue;
                     }
-                    row
-                        .insert_before(
-                            &cell,
-                            add_cells_before.clone().map(|v| v.dyn_into::<Node>().unwrap()).as_ref(),
+                    pinned_rows.insert(k + adjust_y);
+                }
+            }
+
+            // # Prep remove columns
+            let mut pinned_cols = state.pinned_cols.borrow_mut();
+            let mut rev_add_columns = vec![];
+            for rel_x in 0 .. change.remove.0.0 {
+                let x = change.start.0 + X(rel_x);
+                rev_add_columns.push(ChangeSpliceRowCol {
+                    pinned: pinned_cols.contains(&x),
+                    cells: vec![],
+                });
+            }
+            {
+                // Shift column pins by col remove + add
+                let adjust_x = X(0) - change.remove.0 + X(change.add_columns.len() as i64);
+                for k in pinned_cols.split_off(&change.start.0) {
+                    if k < change.start.0 + change.remove.0 {
+                        continue;
+                    }
+                    pinned_cols.insert(k + adjust_x);
+                }
+            }
+
+            // Register new pinned cols
+            for (j, splice_col) in change.add_columns.iter().enumerate() {
+                let x = change.start.0 + X(j as i64);
+                if splice_col.pinned {
+                    pinned_cols.insert(x);
+                }
+            }
+
+            // Add/remove columns
+            let create_rows_start_y;
+            if rows.length() == 0 {
+                create_rows_start_y = Y(1);
+
+                // Add columns if no rows
+                let new_row = document().create_element("tr").unwrap();
+                for (j, col_values) in change.add_columns.iter().enumerate() {
+                    let x = change.start.0 + X(j as i64);
+                    if col_values.cells.len() != 1 {
+                        panic!("See splice struct constraints in comments");
+                    }
+                    new_row
+                        .append_child(
+                            &build_th(
+                                state,
+                                (x, Y(0)),
+                                &pinned_cols,
+                                &pinned_rows,
+                                &col_values.cells.get(0).unwrap(),
+                            ),
                         )
                         .unwrap();
                 }
+                rows_parent.append_child(&new_row).unwrap();
+            } else {
+                create_rows_start_y = change.start.1;
+
+                // Add/remove columns to each row
+                for rel_y in 0 .. rows.length() {
+                    let y = Y(rel_y as i64);
+                    let row = rows.item(rel_y).unwrap();
+                    let cells = row.children();
+
+                    // Remove column cells
+                    for rel_x in 0 .. change.remove.0.0 {
+                        let cell = cells.item(change.start.0.0 as u32).unwrap();
+
+                        // Add cells to reverse change
+                        rev_add_columns.get_mut(rel_x as usize).unwrap().cells.push(get_value(&cell));
+
+                        // Remove
+                        cell.remove();
+                    }
+
+                    // Add new column cells
+                    let add_cells_before = cells.item(change.start.0.0 as u32).map(|v| v.dyn_into::<Node>().unwrap());
+                    for (j, splice_col) in change.add_columns.iter().enumerate() {
+                        let x = change.start.0 + X(j as i64);
+                        let cell_value = splice_col.cells.get(j as usize).unwrap();
+                        let cell;
+                        if rel_y == 0 {
+                            cell = build_th(state, (x, y), &pinned_cols, &pinned_rows, &cell_value);
+                        } else {
+                            cell = build_cell(state, (x, y), &pinned_cols, &pinned_rows, &cell_value);
+                        }
+                        row
+                            .insert_before(
+                                &cell,
+                                add_cells_before.clone().map(|v| v.dyn_into::<Node>().unwrap()).as_ref(),
+                            )
+                            .unwrap();
+                    }
+                }
             }
 
-            // Add rows
+            // Add rows to each column
             let add_rows_before = rows.item(change.start.1.0 as u32 + 1).map(|r| r.dyn_into::<Node>().unwrap());
-            if rows.length() == 0 {
-                let new_row = document().create_element("tr").unwrap();
-                for col_values in &change.add_columns {
-                    if col_values.len() != 1 {
-                        panic!("See splice struct constraints in comments");
-                    }
-                    new_row.append_child(&build_th(&col_values.get(0).unwrap())).unwrap();
+            for (i, splice_row) in change.add_rows.into_iter().enumerate() {
+                let y = create_rows_start_y + Y(i as i64);
+                if splice_row.pinned {
+                    pinned_rows.insert(y);
                 }
-                rows_parent.insert_before(&new_row, add_rows_before.as_ref()).unwrap();
-            }
-            for row_values in change.add_rows {
                 let new_row = document().create_element("tr").unwrap();
-                for cell_value in row_values {
-                    new_row.append_child(&build_cell(&cell_value)).unwrap();
+                for (j, cell_value) in splice_row.cells.into_iter().enumerate() {
+                    new_row
+                        .append_child(&build_cell(state, (X(j as i64), y), &pinned_cols, &pinned_rows, &cell_value))
+                        .unwrap();
                 }
                 rows_parent.insert_before(&new_row, add_rows_before.as_ref()).unwrap();
             }
@@ -325,15 +537,15 @@ fn select(state: &Rc<State>, new_sel: Coord2) {
     register_select(state, &cell);
 }
 
-fn column_count(state: &State) -> X {
+fn table_width(state: &State) -> X {
     let Some(r) = state.tbody.raw().first_element_child() else {
         return X(0);
     };
     return X(r.children().length() as i64);
 }
 
-fn row_count(state: &State) -> Y {
-    return Y(state.tbody.raw().children().length() as i64 - 1);
+fn table_height(state: &State) -> Y {
+    return Y(state.tbody.raw().children().length() as i64);
 }
 
 fn el_toolbar_tab_button(title: impl AsRef<str>, mut cb: impl FnMut(&El) + 'static) -> El {
@@ -418,92 +630,6 @@ fn el_toolbar_button_2state(
             e.ref_modify_classes(&[(state_values[index].1, true), (state_values[other_index].1, false)]);
         }
     }));
-    return out;
-}
-
-fn update_column_pin_from(state: &Rc<State>, cell: &Element) {
-    let start_row_pinned = cell.parent_element().unwrap().get_elements_by_class_name(CLASS_PIN_COL);
-    let pin_x;
-    shed!{
-        'found _;
-        for i in 0 .. start_row_pinned.length() {
-            if &start_row_pinned.item(i).unwrap() == cell {
-                pin_x = i as u32;
-                break 'found;
-            }
-        }
-        panic!();
-    };
-    let cell = cell.dyn_ref::<HtmlElement>().unwrap();
-    let start_right = cell.get_bounding_client_rect().right();
-    for row in get_rows(&state) {
-        let row_pinned = row.get_elements_by_class_name(CLASS_PIN_COL);
-        let mut prev_right = start_right;
-        for i in pin_x + 1 .. row_pinned.length() {
-            let cell = row_pinned.item(i).unwrap().dyn_into::<HtmlElement>().unwrap();
-            cell.style().set_property("inset-left", &format!("{}px", prev_right)).unwrap();
-            prev_right = cell.get_bounding_client_rect().right();
-        }
-    }
-}
-
-fn update_row_pin_from(cell: &Element) {
-    let row = cell.parent_element().unwrap();
-    let pinned_rows = row.parent_element().unwrap().get_elements_by_class_name(CLASS_PIN_ROW);
-    let pin_y;
-    shed!{
-        'found _;
-        for i in 0 .. pinned_rows.length() {
-            if pinned_rows.item(i).unwrap() == row {
-                pin_y = i as u32;
-                break 'found;
-            }
-        }
-        panic!();
-    };
-    let cell = cell.dyn_ref::<HtmlElement>().unwrap();
-    let mut prev_bottom = cell.get_bounding_client_rect().bottom();
-    for i in pin_y + 1 .. pinned_rows.length() {
-        let row = pinned_rows.item(i).unwrap().dyn_into::<HtmlElement>().unwrap();
-        row.style().set_property("inset-top", &format!("{}px", prev_bottom)).unwrap();
-        prev_bottom = row.get_bounding_client_rect().bottom();
-    }
-}
-
-fn get_column(state: &State, col: X) -> Vec<Element> {
-    let mut out = vec![];
-    let Some(mut at) = state.tbody.raw().first_element_child() else {
-        return vec![];
-    };
-
-    // (Skip first child - header)
-    while let Some(row) = at.next_element_sibling() {
-        out.push(row.children().item(col.0 as u32).unwrap());
-        at = row;
-    }
-    return out;
-}
-
-fn get_rows(state: &State) -> Vec<Element> {
-    let mut out = vec![];
-    let Some(mut at) = state.tbody.raw().first_element_child() else {
-        return vec![];
-    };
-
-    // (Skip first child - header)
-    while let Some(row) = at.next_element_sibling() {
-        out.push(row.clone());
-        at = row;
-    }
-    return out;
-}
-
-fn get_row(state: &State, row: Y) -> Vec<Element> {
-    let mut out = vec![];
-    let row = state.tbody.raw().children().item((row.0) as u32).unwrap().children();
-    for i in 0 .. row.length() {
-        out.push(row.item(i).unwrap());
-    }
     return out;
 }
 
@@ -601,7 +727,10 @@ fn act_add_left(state: &Rc<State>) {
     let change = Change::Splice(ChangeSplice {
         start: (sel_xy.0, Y(0)),
         remove: (X(0), Y(0)),
-        add_columns: vec![(0 .. 1 + row_count(&state).0).map(|_| v_str("")).collect()],
+        add_columns: vec![ChangeSpliceRowCol {
+            pinned: false,
+            cells: (0 .. table_height(&state).0).map(|_| v_str("")).collect(),
+        }],
         add_rows: vec![],
     });
     flush_undo(&state.change);
@@ -617,7 +746,10 @@ fn act_add_right(state: &Rc<State>) {
     let change = Change::Splice(ChangeSplice {
         start: (sel_xy.0 + X(1), Y(0)),
         remove: (X(0), Y(0)),
-        add_columns: vec![(0 .. 1 + row_count(&state).0).map(|_| v_str("")).collect()],
+        add_columns: vec![ChangeSpliceRowCol {
+            pinned: false,
+            cells: (0 .. table_height(&state).0).map(|_| v_str("")).collect(),
+        }],
         add_rows: vec![],
     });
     flush_undo(&state.change);
@@ -626,22 +758,66 @@ fn act_add_right(state: &Rc<State>) {
     select(&state, (sel_xy.0 + X(1), sel_xy.1));
 }
 
+fn act_sort(state: &Rc<State>, rev: bool) {
+    let Some((sel_xy, _)) = find_selection(&state) else {
+        return;
+    };
+    let mut value_rows = vec![];
+    let rows = state.tbody.raw().children();
+    for rel_y in 1 .. rows.length() {
+        let row = rows.item(rel_y).unwrap().children();
+        let mut value_row = vec![];
+        for rel_x in 0 .. row.length() {
+            let el_cell = row.item(rel_x).unwrap();
+            value_row.push(get_value(&el_cell));
+        }
+        value_rows.push(value_row);
+    }
+    let col_idx = sel_xy.0.0;
+    if rev {
+        value_rows.sort_by_cached_key(|r| Reverse(r.get(col_idx as usize).unwrap().clone()));
+    } else {
+        value_rows.sort_by_cached_key(|r| r.get(col_idx as usize).unwrap().clone());
+    }
+    let mut change = ChangeCells { cells: HashMap::new() };
+    for (row_idx, row) in value_rows.into_iter().enumerate() {
+        for (col_idx, cell) in row.into_iter().enumerate() {
+            change.cells.insert((X(row_idx as i64 + 1), Y(col_idx as i64)), cell);
+        }
+    }
+    flush_undo(&state.change);
+    push_undo(&state.change, Some(sel_xy), apply(&state, Change::Cells(change)).1);
+    flush_undo(&state.change);
+}
+
+fn copy_row_values(state: &Rc<State>, y: Y) -> Vec<Value> {
+    let base_row = state.tbody.raw().children().item(y.0 as u32).unwrap().children();
+    let mut cells = vec![];
+    for rel_x in 0 .. base_row.length() {
+        let base_cell = base_row.item(rel_x).unwrap();
+        cells.push(Value {
+            type_: get_value(&base_cell).type_,
+            string: "".to_string(),
+        });
+    }
+    return cells;
+}
+
 fn act_add_up(state: &Rc<State>) {
     let Some((sel_xy, _)) = find_selection(state) else {
         return;
     };
-    if sel_xy.1 == Y(0) {
+    if sel_xy.1 <= Y(1) {
         return;
     }
-    let base_row = get_row(&state, sel_xy.1);
     let change = Change::Splice(ChangeSplice {
         start: (X(0), sel_xy.1),
         remove: (X(0), Y(0)),
         add_columns: vec![],
-        add_rows: vec![base_row.into_iter().map(|base_cell| Value {
-            type_: get_value(&base_cell).type_,
-            string: "".to_string(),
-        }).collect()],
+        add_rows: vec![ChangeSpliceRowCol {
+            pinned: false,
+            cells: copy_row_values(state, sel_xy.1),
+        }],
     });
     flush_undo(&state.change);
     push_undo(&state.change, Some(sel_xy), apply(&state, change).1);
@@ -656,15 +832,14 @@ fn act_add_down(state: &Rc<State>) {
     if sel_xy.1 == Y(0) {
         return;
     }
-    let base_row = get_row(&state, sel_xy.1);
     let change = Change::Splice(ChangeSplice {
         start: (X(0), sel_xy.1 + Y(1)),
         remove: (X(0), Y(0)),
         add_columns: vec![],
-        add_rows: vec![base_row.into_iter().map(|base_cell| Value {
-            type_: get_value(&base_cell).type_,
-            string: "".to_string(),
-        }).collect()],
+        add_rows: vec![ChangeSpliceRowCol {
+            pinned: false,
+            cells: copy_row_values(state, sel_xy.1),
+        }],
     });
     flush_undo(&state.change);
     push_undo(&state.change, Some(sel_xy), apply(&state, change).1);
@@ -691,9 +866,15 @@ fn build_toolbar_sheet(state: &Rc<State>, button: &El, toolbar: &El, sheet_actio
             move |_| {
                 let (new_sel, rev_change) = apply(&state, Change::Splice(ChangeSplice {
                     start: (X(0), Y(0)),
-                    remove: (column_count(&state), row_count(&state)),
-                    add_columns: vec![vec![v_str("")]],
-                    add_rows: vec![vec![v_str("")]],
+                    remove: (table_width(&state), table_height(&state)),
+                    add_columns: vec![ChangeSpliceRowCol {
+                        pinned: false,
+                        cells: vec![v_str("")],
+                    }],
+                    add_rows: vec![ChangeSpliceRowCol {
+                        pinned: false,
+                        cells: vec![v_str("")],
+                    }],
                 }));
                 flush_undo(&state.change);
                 push_undo(&state.change, find_selection(&state).map(|s| s.0), rev_change);
@@ -735,43 +916,24 @@ fn build_toolbar_column(state: &Rc<State>, button: &El, toolbar: &El) {
                 let Some((sel_xy, _)) = find_selection(&state) else {
                     return;
                 };
-                let mut cells = get_column(&state, sel_xy.0).into_iter();
-                let Some(first_cell) = cells.next() else {
-                    panic!();
-                };
-                let first_classes = first_cell.class_list();
-                let unpinned = !first_classes.contains(CLASS_PIN_COL);
-                if !unpinned {
-                    first_classes.remove_1(CLASS_PIN_COL).unwrap();
-                    state.pin_resize_observer.get().unwrap().0.js_resize_observer.unobserve(&first_cell);
-                    for cell in cells {
-                        cell.class_list().remove_1(CLASS_PIN_COL).unwrap();
-                        state.pin_resize_observer.get().unwrap().0.js_resize_observer.unobserve(&cell);
-                    }
+                let want_col_pinned = !state.pinned_cols.borrow().contains(&sel_xy.0);
+                if want_col_pinned {
+                    state.pinned_cols.borrow_mut().insert(sel_xy.0);
                 } else {
-                    first_classes.add_1(CLASS_PIN_COL).unwrap();
-                    let obs_opts = ResizeObserverOptions::new();
-                    obs_opts.set_box(ResizeObserverBoxOptions::BorderBox);
-                    state
-                        .pin_resize_observer
-                        .get()
-                        .unwrap()
-                        .0
-                        .js_resize_observer
-                        .observe_with_options(&first_cell, &obs_opts);
-                    for cell in cells {
-                        cell.class_list().add_1(CLASS_PIN_COL).unwrap();
-                        state
-                            .pin_resize_observer
-                            .get()
-                            .unwrap()
-                            .0
-                            .js_resize_observer
-                            .observe_with_options(&cell, &obs_opts);
-                    }
-                    update_column_pin_from(&state, &first_cell);
+                    state.pinned_cols.borrow_mut().remove(&sel_xy.0);
                 }
-                state.selected_col_unpinned.set(unpinned);
+                let rows = state.tbody.raw().children();
+                for rel_y in 0 .. rows.length() {
+                    let row_pinned = state.pinned_rows.borrow().contains(&Y(rel_y as i64));
+                    update_cell_pin(
+                        &state,
+                        &rows.item(rel_y).unwrap().children().item(sel_xy.0.0 as u32).unwrap(),
+                        want_col_pinned,
+                        row_pinned,
+                    );
+                }
+                update_column_pin_offsets(&state);
+                state.selected_col_unpinned.set(!want_col_pinned);
             }
         }),
         el_toolbar_button("Add left", ICON_ADD_LEFT, &state.always, {
@@ -788,14 +950,17 @@ fn build_toolbar_column(state: &Rc<State>, button: &El, toolbar: &El) {
                 let Some((sel_xy, _)) = find_selection(&state) else {
                     return;
                 };
-                let col_count = column_count(&state);
+                let col_count = table_width(&state);
                 let change = Change::Splice(ChangeSplice {
                     start: (sel_xy.0, Y(0)),
                     remove: (X(1), Y(0)),
                     add_columns: if col_count > X(1) {
                         vec![]
                     } else {
-                        vec![(0 .. 1 + row_count(&state).0).map(|_| v_str("")).collect()]
+                        vec![ChangeSpliceRowCol {
+                            pinned: false,
+                            cells: (0 .. table_height(&state).0).map(|_| v_str("")).collect(),
+                        }]
                     },
                     add_rows: vec![],
                 });
@@ -810,61 +975,11 @@ fn build_toolbar_column(state: &Rc<State>, button: &El, toolbar: &El) {
         }),
         el_toolbar_button("Sort", ICON_SORT, &state.always, {
             let state = state.clone();
-            move |_| {
-                let Some((sel_xy, _)) = find_selection(&state) else {
-                    return;
-                };
-                let mut rows1 = vec![];
-                for row in get_rows(&state) {
-                    let mut cells = vec![];
-                    let el_cells = row.children();
-                    for i in 0 .. el_cells.length() {
-                        let el_cell = el_cells.item(i).unwrap();
-                        cells.push(get_value(&el_cell));
-                    }
-                    rows1.push(cells);
-                }
-                let col_idx = sel_xy.0.0;
-                rows1.sort_by_cached_key(|r| r.get(col_idx as usize).unwrap().clone());
-                let mut change = ChangeCells { cells: HashMap::new() };
-                for (row_idx, row) in rows1.into_iter().enumerate() {
-                    for (col_idx, cell) in row.into_iter().enumerate() {
-                        change.cells.insert((X(row_idx as i64), Y(col_idx as i64)), cell);
-                    }
-                }
-                flush_undo(&state.change);
-                push_undo(&state.change, Some(sel_xy), apply(&state, Change::Cells(change)).1);
-                flush_undo(&state.change);
-            }
+            move |_| act_sort(&state, false)
         }),
-        el_toolbar_button("Sort reverse", ICON_SORT_REV, &state.always, {
+        el_toolbar_button("Sort reversed", ICON_SORT_REV, &state.always, {
             let state = state.clone();
-            move |_| {
-                let Some((sel_xy, _)) = find_selection(&state) else {
-                    return;
-                };
-                let mut rows1 = vec![];
-                for row in get_rows(&state) {
-                    let mut cells = vec![];
-                    let el_cells = row.children();
-                    for i in 0 .. el_cells.length() {
-                        let el_cell = el_cells.item(i).unwrap();
-                        cells.push(get_value(&el_cell));
-                    }
-                    rows1.push(cells);
-                }
-                let col_idx = sel_xy.0.0;
-                rows1.sort_by_cached_key(|r| Reverse(r.get(col_idx as usize).unwrap().clone()));
-                let mut change = ChangeCells { cells: HashMap::new() };
-                for (row_idx, row) in rows1.into_iter().enumerate() {
-                    for (col_idx, cell) in row.into_iter().enumerate() {
-                        change.cells.insert((X(row_idx as i64), Y(col_idx as i64)), cell);
-                    }
-                }
-                flush_undo(&state.change);
-                push_undo(&state.change, Some(sel_xy), apply(&state, Change::Cells(change)).1);
-                flush_undo(&state.change);
-            }
+            move |_| act_sort(&state, true)
         })
     ]);
 }
@@ -880,51 +995,23 @@ fn build_toolbar_row(state: &Rc<State>, button: &El, toolbar: &El) {
             &state.selected_row_unpinned,
             {
                 let state = state.clone();
-                move |e| {
+                move |_| {
                     let Some((sel_xy, _)) = find_selection(&state) else {
                         return;
                     };
-                    let mut cells = get_row(&state, sel_xy.1).into_iter();
-                    let Some(first_cell) = cells.next() else {
-                        panic!();
-                    };
-                    let first_classes = first_cell.class_list();
-                    let unpinned = !first_classes.contains(CLASS_PIN_ROW);
-                    if !unpinned {
-                        first_classes.remove_1(CLASS_PIN_ROW).unwrap();
-                        state.pin_resize_observer.get().unwrap().0.js_resize_observer.unobserve(&first_cell);
-                        for cell in cells {
-                            cell.class_list().remove_1(CLASS_PIN_ROW).unwrap();
-                            state.pin_resize_observer.get().unwrap().0.js_resize_observer.unobserve(&cell);
-                        }
-                        e.ref_text("Pin");
-                        e.ref_modify_classes(&[(CLASS_BUTTON_PIN, true), (CLASS_BUTTON_UNPIN, false)]);
+                    let want_row_pinned = !state.pinned_rows.borrow().contains(&sel_xy.1);
+                    if want_row_pinned {
+                        state.pinned_rows.borrow_mut().insert(sel_xy.1);
                     } else {
-                        first_classes.add_1(CLASS_PIN_ROW).unwrap();
-                        let obs_opts = ResizeObserverOptions::new();
-                        obs_opts.set_box(ResizeObserverBoxOptions::BorderBox);
-                        state
-                            .pin_resize_observer
-                            .get()
-                            .unwrap()
-                            .0
-                            .js_resize_observer
-                            .observe_with_options(&first_cell, &obs_opts);
-                        for cell in cells {
-                            cell.class_list().add_1(CLASS_PIN_ROW).unwrap();
-                            state
-                                .pin_resize_observer
-                                .get()
-                                .unwrap()
-                                .0
-                                .js_resize_observer
-                                .observe_with_options(&cell, &obs_opts);
-                        }
-                        e.ref_text("Unpin");
-                        e.ref_modify_classes(&[(CLASS_BUTTON_PIN, false), (CLASS_BUTTON_UNPIN, true)]);
-                        update_row_pin_from(&first_cell);
+                        state.pinned_rows.borrow_mut().remove(&sel_xy.1);
                     }
-                    state.selected_col_unpinned.set(unpinned);
+                    let row = state.tbody.raw().children().item(sel_xy.1.0 as u32).unwrap().children();
+                    for rel_x in 0 .. row.length() {
+                        let col_pinned = state.pinned_cols.borrow().contains(&X(rel_x as i64));
+                        update_cell_pin(&state, &row.item(rel_x).unwrap(), col_pinned, want_row_pinned);
+                    }
+                    update_row_pin_offsets(&state);
+                    state.selected_row_unpinned.set(!want_row_pinned);
                 }
             },
         ),
@@ -995,7 +1082,7 @@ fn build_toolbar_row(state: &Rc<State>, button: &El, toolbar: &El) {
                 let Some((sel_xy, _)) = find_selection(&state) else {
                     return;
                 };
-                if sel_xy.1 == row_count(&state) {
+                if sel_xy.1 + Y(1) == table_height(&state) {
                     return;
                 }
                 flush_undo(&state.change);
@@ -1272,10 +1359,10 @@ fn register_select(state: &Rc<State>, cell: &Element) {
         } else {
             state.selected_cell.set(true);
             state.selected_th_or_cell.set(true);
-            state.selected_row_unpinned.set(!classes.contains(CLASS_PIN_ROW));
+            state.selected_row_unpinned.set(!state.pinned_rows.borrow().contains(&xy.1));
             update_value_obsbools(state, cell);
         }
-        state.selected_col_unpinned.set(!classes.contains(CLASS_PIN_COL));
+        state.selected_col_unpinned.set(!state.pinned_cols.borrow().contains(&xy.0));
     }
 }
 
@@ -1290,10 +1377,10 @@ impl Editor {
     }
 
     pub fn set_data(&self, data: Vec<serde_json::Value>) -> Result<(), String> {
-        let value_data = json_to_value_rows(data)?;
+        let value_data = json_to_splice(data)?;
         let (_, rev_change) = apply(&self.state, Change::Splice(ChangeSplice {
             start: (X(0), Y(0)),
-            remove: (column_count(&self.state), row_count(&self.state)),
+            remove: (table_width(&self.state), table_height(&self.state)),
             add_columns: value_data.columns,
             add_rows: value_data.rows,
         }));
@@ -1359,12 +1446,14 @@ pub struct EditorOptions {
     pub initial_data: Vec<serde_json::Value>,
 }
 
-struct ColsRows {
-    columns: Vec<Vec<Value>>,
-    rows: Vec<Vec<Value>>,
+// Columns and rows for splice that clears everything first (1-cell columns, then
+// with correct cell counts)
+struct InitialSpliceColsRows {
+    columns: Vec<ChangeSpliceRowCol>,
+    rows: Vec<ChangeSpliceRowCol>,
 }
 
-fn json_to_value_rows(source: Vec<serde_json::Value>) -> Result<ColsRows, String> {
+fn json_to_splice(source: Vec<serde_json::Value>) -> Result<InitialSpliceColsRows, String> {
     let mut add_columns = BTreeSet::new();
     for (i, row) in source.iter().enumerate() {
         let serde_json::Value::Object(row) = row else {
@@ -1423,20 +1512,26 @@ fn json_to_value_rows(source: Vec<serde_json::Value>) -> Result<ColsRows, String
                 string: string,
             });
         }
-        add_rows.push(row);
+        add_rows.push(ChangeSpliceRowCol {
+            pinned: false,
+            cells: row,
+        });
     }
     if add_rows.is_empty() {
         return Err("Initial data is empty!".to_string());
     }
-    return Ok(ColsRows {
-        columns: add_columns.into_iter().map(|c| vec![v_str(c)]).collect(),
+    return Ok(InitialSpliceColsRows {
+        columns: add_columns.into_iter().map(|c| ChangeSpliceRowCol {
+            pinned: false,
+            cells: vec![v_str(c)],
+        }).collect(),
         rows: add_rows,
     });
 }
 
 pub fn create_editor(opts: EditorOptions) -> Result<Editor, String> {
     // Preprocess data
-    let initial = json_to_value_rows(opts.initial_data)?;
+    let initial = json_to_splice(opts.initial_data)?;
 
     // Construct
     let root = el("div").classes(&[CLASS_ROOT]);
@@ -1461,6 +1556,8 @@ pub fn create_editor(opts: EditorOptions) -> Result<Editor, String> {
         selected_cell_not_json: ObsBool::new(false),
         selected_cell_not_null: ObsBool::new(false),
         selected_cell_not_missing: ObsBool::new(false),
+        pinned_cols: Default::default(),
+        pinned_rows: Default::default(),
         hotkeys: opts
             .sheet_actions
             .iter()
@@ -1470,30 +1567,12 @@ pub fn create_editor(opts: EditorOptions) -> Result<Editor, String> {
     state.pin_resize_observer.get_or_init(|| {
         return ResizeObserver::new({
             let state = state.clone();
-            move |elements| {
-                let mut min_x: Option<(usize, Element)> = None;
-                let mut min_y: Option<(usize, Element)> = None;
-                for el in elements {
-                    let el = el.dyn_into::<Element>().unwrap();
-                    let el_classes = el.class_list();
-                    if el_classes.contains(CLASS_PIN_COL) {
-                        let x = index_in_parent(&el);
-                        if min_x.is_none() || min_x.as_ref().unwrap().0 > x {
-                            min_x = Some((x, el.clone()));
-                        }
-                    }
-                    if el_classes.contains(CLASS_PIN_ROW) {
-                        let y = index_in_parent(&el.parent_element().unwrap());
-                        if min_y.is_none() || min_y.as_ref().unwrap().0 > y {
-                            min_y = Some((y, el.clone()));
-                        }
-                    }
+            move |_| {
+                if !state.pinned_cols.borrow().is_empty() {
+                    update_column_pin_offsets(&state);
                 }
-                if let Some((_, el)) = min_x {
-                    update_column_pin_from(&state, &el);
-                }
-                if let Some((_, el)) = min_y {
-                    update_row_pin_from(&el);
+                if !state.pinned_rows.borrow().is_empty() {
+                    update_row_pin_offsets(&state);
                 }
             }
         });
@@ -1558,16 +1637,15 @@ pub fn create_editor(opts: EditorOptions) -> Result<Editor, String> {
                     continue;
                 };
                 let xy = get_xy(&cell);
-                let cell_change;
-                cell_change = Value::from_str(&cell.get_attribute(ATTR_TH_CELL_OLD_VALUE).unwrap()).unwrap();
+                let old_value = Value::from_str(&cell.get_attribute(ATTR_TH_CELL_OLD_VALUE).unwrap()).unwrap();
                 let new_value = get_value(&cell);
                 cell.set_attribute(ATTR_TH_CELL_OLD_VALUE, &new_value.to_string()).unwrap();
-                validate_cell(&cell, &new_value);
                 push_undo(
                     &state.change,
                     Some(xy),
-                    Change::Cells(ChangeCells { cells: [(xy, cell_change)].into_iter().collect() }),
+                    Change::Cells(ChangeCells { cells: [(xy, old_value)].into_iter().collect() }),
                 );
+                validate_cell(&cell, xy.1, &new_value);
             }
         }) as Box<dyn Fn(Array, JsValue)>);
         text_obs = MutationObserver::new(js_cb.as_ref().unchecked_ref()).unwrap();
@@ -1585,7 +1663,11 @@ pub fn create_editor(opts: EditorOptions) -> Result<Editor, String> {
             let Some((_, e)) = find_selection(&state) else {
                 return;
             };
-            e.dyn_into::<HtmlElement>().unwrap().focus().unwrap();
+            e.dyn_into::<HtmlElement>().unwrap().focus_with_options(&{
+                let o = FocusOptions::new();
+                o.set_prevent_scroll(true);
+                o
+            }).unwrap();
         }
     }).ref_on_with_options("keydown", EventListenerOptions {
         phase: EventListenerPhase::Bubble,
@@ -1610,6 +1692,7 @@ pub fn create_editor(opts: EditorOptions) -> Result<Editor, String> {
                     for (hotkey, cb) in &state.hotkeys {
                         if hotkey.key == ev.key() && hotkey.ctrl == ev.ctrl_key() && hotkey.alt == ev.alt_key() {
                             (*cb.borrow_mut())(Editor { state: state.clone() });
+                            ev.prevent_default();
                             return;
                         }
                     }
@@ -1631,7 +1714,7 @@ pub fn create_editor(opts: EditorOptions) -> Result<Editor, String> {
                                 act_add_down(&state);
                                 ev.prevent_default();
                             } else {
-                                if xy.1 == row_count(&state) {
+                                if xy.1 + Y(1) == table_height(&state) {
                                     return;
                                 }
                                 select(&state, (xy.0, xy.1 + Y(1)));
@@ -1655,7 +1738,7 @@ pub fn create_editor(opts: EditorOptions) -> Result<Editor, String> {
                                 act_add_right(&state);
                                 ev.prevent_default();
                             } else {
-                                if xy.0 == column_count(&state) {
+                                if xy.0 + X(1) == table_width(&state) {
                                     return;
                                 }
                                 select(&state, (xy.0 + X(1), xy.1));

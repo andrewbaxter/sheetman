@@ -1,8 +1,10 @@
 use {
     std::{
         fs::{
+            read,
             write,
         },
+        os::unix::ffi::OsStrExt,
         path::PathBuf,
         sync::{
             LazyLock,
@@ -10,6 +12,7 @@ use {
         },
     },
     tauri_plugin_dialog::DialogExt,
+    tokio::sync::oneshot,
 };
 
 pub struct State {
@@ -25,6 +28,40 @@ pub fn default_data() -> Vec<serde_json::Value> {
             [("".to_string(), serde_json::Value::String("".to_string()))].into_iter().collect(),
         )
     ];
+}
+
+#[tauri::command]
+async fn command_open(app_handle: tauri::AppHandle) -> Result<Option<Vec<serde_json::Value>>, String> {
+    let (res_tx, res_rx) = oneshot::channel();
+    app_handle
+        .dialog()
+        .file()
+        .add_filter("JSV", &["jsv"])
+        .pick_file(move |file_path| res_tx.send(file_path).unwrap());
+    let Some(file_path) = res_rx.await.unwrap() else {
+        return Ok(None);
+    };
+    let file_path = file_path.into_path().unwrap();
+    let rows;
+    let raw_data =
+        read(&file_path).map_err(|e| format!("Failed to read file [{}]: {}", file_path.to_string_lossy(), e))?;
+    match file_path.extension().map(|x| x.as_bytes()) {
+        Some(b"jsv") => {
+            rows =
+                serde_json::from_slice::<Vec<serde_json::Value>>(
+                    &raw_data,
+                ).map_err(|e| format!("Failed to parse file json into expected structure: {}", e))?;
+        },
+        _ => {
+            return Err(
+                format!("Missing or unknown extension for specified filename {}", file_path.to_string_lossy()).into(),
+            );
+        },
+    }
+    let mut state = STATE.lock().unwrap();
+    let filename = &mut state.as_mut().unwrap().filename;
+    *filename = file_path;
+    return Ok(Some(rows));
 }
 
 #[tauri::command]
@@ -71,7 +108,9 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
-        .invoke_handler(tauri::generate_handler![command_take_initial_data, command_save, command_save_as])
+        .invoke_handler(
+            tauri::generate_handler![command_take_initial_data, command_open, command_save, command_save_as],
+        )
         .setup(|_app| {
             let mut state = STATE.lock().unwrap();
             if state.is_none() {
