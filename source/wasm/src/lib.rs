@@ -1684,6 +1684,12 @@ pub fn create_editor(opts: EditorOptions) -> Result<Editor, String> {
                             stop_editing_cell(&cell);
                             ev.prevent_default();
                         },
+                        "Enter" => {
+                            if !ev.shift_key() {
+                                stop_editing_cell(&cell);
+                                ev.prevent_default();
+                            }
+                        },
                         _ => {
                             // nop
                         },
@@ -1697,7 +1703,7 @@ pub fn create_editor(opts: EditorOptions) -> Result<Editor, String> {
                         }
                     }
                     match ev.key().as_str() {
-                        "ArrowUp" => {
+                        "ArrowUp" | "k" => {
                             if ev.ctrl_key() && xy.1 >= Y(1) {
                                 act_add_up(&state);
                                 ev.prevent_default();
@@ -1709,7 +1715,7 @@ pub fn create_editor(opts: EditorOptions) -> Result<Editor, String> {
                                 ev.prevent_default();
                             }
                         },
-                        "ArrowDown" => {
+                        "ArrowDown" | "j" => {
                             if ev.ctrl_key() && xy.1 >= Y(1) {
                                 act_add_down(&state);
                                 ev.prevent_default();
@@ -1721,7 +1727,7 @@ pub fn create_editor(opts: EditorOptions) -> Result<Editor, String> {
                                 ev.prevent_default();
                             }
                         },
-                        "ArrowLeft" => {
+                        "ArrowLeft" | "h" => {
                             if ev.ctrl_key() {
                                 act_add_left(&state);
                                 ev.prevent_default();
@@ -1733,7 +1739,7 @@ pub fn create_editor(opts: EditorOptions) -> Result<Editor, String> {
                                 ev.prevent_default();
                             }
                         },
-                        "ArrowRight" => {
+                        "ArrowRight" | "l" => {
                             if ev.ctrl_key() {
                                 act_add_right(&state);
                                 ev.prevent_default();

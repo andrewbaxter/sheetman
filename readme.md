@@ -12,6 +12,8 @@ Why JSV? Pretty-printed it works with line-based diff and it's better specified 
 
 # Try it out
 
+Note: Firefox [doesn't work yet](https://caniuse.com/mdn-html_global_attributes_contenteditable_plaintext-only)
+
 Online, at <https://andrewbaxter.github.io/sheetman/>
 
 Offline, see the releases for desktop builds (Linux AppImage, Windows)
@@ -34,9 +36,9 @@ Generally speaking, all keyboard interaction (hotkeys, typing, navigation) requi
 
 Some of these may be desktop/website/embedded specific. If there's a button in the menu it should work.
 
-- `Arrow key` - Select a different cell/header
+- `Arrow key/HJKL` - Select a different cell/header
 
-- `Ctrl + arrow key` - Create a new column/row in the specified direction of the current cell
+- `Ctrl + arrow key/HJKL` - Create a new column/row in the specified direction of the current cell
 
 - `Ctrl + o` - Open a file
 
