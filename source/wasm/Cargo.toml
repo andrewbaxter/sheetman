@@ -43,7 +43,9 @@ web-sys = { version = "0.3", features = [
 ] }
 rooting = { version = "0.1" }
 flowcontrol = "0.2"
-serde_json = "1"
+serde_json = { version = "1", features = ["raw_value"] }
 serde = { version = "1", features = ["derive"] }
 derive_more = { version = "1", features = ["mul", "add"] }
 web-time = "1"
+wasm-bindgen-futures = "0.4"
+indexmap = { version = "2.6.0", features = ["serde"] }

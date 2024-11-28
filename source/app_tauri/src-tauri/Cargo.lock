@@ -3931,6 +3931,7 @@ name = "tauri"
 version = "0.1.0"
 dependencies = [
  "aargvark",
+ "indexmap 2.6.0",
  "resvg",
  "serde",
  "serde_json",

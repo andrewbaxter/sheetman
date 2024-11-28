@@ -1,37 +1,65 @@
 use {
+    indexmap::IndexMap,
+    serde_json::value::RawValue,
     std::{
         fs::{
             read,
             write,
         },
         os::unix::ffi::OsStrExt,
-        path::PathBuf,
+        path::{
+            Path,
+            PathBuf,
+        },
         sync::{
             LazyLock,
             Mutex,
         },
     },
+    tauri::Manager,
     tauri_plugin_dialog::DialogExt,
     tokio::sync::oneshot,
 };
 
 pub struct State {
-    pub filename: PathBuf,
-    pub initial_data: Option<Box<Vec<serde_json::Value>>>,
+    pub file_path: PathBuf,
+    pub initial_data: Option<Box<Vec<IndexMap<String, Box<RawValue>>>>>,
 }
 
 pub static STATE: LazyLock<Mutex<Option<State>>> = LazyLock::new(|| Mutex::new(None));
 
-pub fn default_data() -> Vec<serde_json::Value> {
+fn format_title(file_path: &Path) -> String {
+    return format!("{} - Sheetman", file_path.file_name().unwrap_or(file_path.as_os_str()).to_string_lossy());
+}
+
+fn update_current_file_path(app_handle: &tauri::AppHandle, new: PathBuf) {
+    let mut state = STATE.lock().unwrap();
+    let file_path = &mut state.as_mut().unwrap().file_path;
+    if let Some(w) = app_handle.webview_windows().values().next() {
+        w.set_title(&format_title(&new)).unwrap();
+    }
+    *file_path = new;
+}
+
+pub fn default_data() -> Vec<IndexMap<String, Box<RawValue>>> {
     return vec![
-        serde_json::Value::Object(
-            [("".to_string(), serde_json::Value::String("".to_string()))].into_iter().collect(),
-        )
+        [
+            (
+                "".to_string(),
+                RawValue::from_string(
+                    serde_json::to_string(&serde_json::Value::String("".to_string())).unwrap(),
+                ).unwrap(),
+            ),
+        ]
+            .into_iter()
+            .collect()
     ];
 }
 
 #[tauri::command]
-async fn command_open(app_handle: tauri::AppHandle) -> Result<Option<Vec<serde_json::Value>>, String> {
+async fn command_open(
+    app_handle: tauri::AppHandle,
+) -> Result<Option<Vec<IndexMap<String, Box<RawValue>>>>, String> {
     let (res_tx, res_rx) = oneshot::channel();
     app_handle
         .dialog()
@@ -48,7 +76,7 @@ async fn command_open(app_handle: tauri::AppHandle) -> Result<Option<Vec<serde_j
     match file_path.extension().map(|x| x.as_bytes()) {
         Some(b"jsv") => {
             rows =
-                serde_json::from_slice::<Vec<serde_json::Value>>(
+                serde_json::from_slice::<Vec<IndexMap<String, Box<RawValue>>>>(
                     &raw_data,
                 ).map_err(|e| format!("Failed to parse file json into expected structure: {}", e))?;
         },
@@ -58,18 +86,16 @@ async fn command_open(app_handle: tauri::AppHandle) -> Result<Option<Vec<serde_j
             );
         },
     }
-    let mut state = STATE.lock().unwrap();
-    let filename = &mut state.as_mut().unwrap().filename;
-    *filename = file_path;
+    update_current_file_path(&app_handle, file_path);
     return Ok(Some(rows));
 }
 
 #[tauri::command]
-fn command_take_initial_data() -> Vec<serde_json::Value> {
+fn command_take_initial_data() -> Vec<IndexMap<String, Box<RawValue>>> {
     return *STATE.lock().unwrap().as_mut().unwrap().initial_data.take().unwrap();
 }
 
-fn save(filename: &PathBuf, data: Vec<serde_json::Value>) -> Result<(), String> {
+fn save(filename: &PathBuf, data: Vec<IndexMap<String, Box<RawValue>>>) -> Result<(), String> {
     write(
         &filename,
         serde_json::to_vec_pretty(&data).unwrap(),
@@ -78,26 +104,28 @@ fn save(filename: &PathBuf, data: Vec<serde_json::Value>) -> Result<(), String> 
 }
 
 #[tauri::command]
-fn command_save(data: Vec<serde_json::Value>) -> Result<(), String> {
+fn command_save(data: Vec<IndexMap<String, Box<RawValue>>>) -> Result<(), String> {
     let state = STATE.lock().unwrap();
-    let filename = &state.as_ref().unwrap().filename;
+    let filename = &state.as_ref().unwrap().file_path;
     save(&filename, data)?;
     return Ok(());
 }
 
 #[tauri::command]
-fn command_save_as(app_handle: tauri::AppHandle, data: Vec<serde_json::Value>) -> Result<(), String> {
-    app_handle.dialog().file().add_filter("JSV", &["jsv"]).save_file(|file_path| {
+fn command_save_as(
+    app_handle: tauri::AppHandle,
+    data: Vec<IndexMap<String, Box<RawValue>>>,
+) -> Result<(), String> {
+    app_handle.dialog().file().add_filter("JSV", &["jsv"]).save_file(move |file_path| {
         if let Some(file_path) = file_path {
-            let mut state = STATE.lock().unwrap();
-            let filename = &mut state.as_mut().unwrap().filename;
-            *filename = file_path.into_path().unwrap();
-            match save(&filename, data) {
+            let file_path = file_path.into_path().unwrap();
+            match save(&file_path, data) {
                 Ok(_) => { },
                 Err(e) => {
-                    eprintln!("Error saving file at [{}]: {}", filename.to_string_lossy(), e);
+                    eprintln!("Error saving file at [{}]: {}", file_path.to_string_lossy(), e);
                 },
             }
+            update_current_file_path(&app_handle, file_path);
         }
     });
     return Ok(());
@@ -111,13 +139,16 @@ pub fn run() {
         .invoke_handler(
             tauri::generate_handler![command_take_initial_data, command_open, command_save, command_save_as],
         )
-        .setup(|_app| {
+        .setup(|app| {
             let mut state = STATE.lock().unwrap();
             if state.is_none() {
                 *state = Some(State {
-                    filename: PathBuf::from("sheet.jsv"),
+                    file_path: PathBuf::from("sheet.jsv"),
                     initial_data: Some(Box::new(default_data())),
                 });
+            }
+            if let Some(w) = app.webview_windows().values().next() {
+                w.set_title(&format_title(&state.as_ref().unwrap().file_path)).unwrap();
             }
             Ok(())
         })

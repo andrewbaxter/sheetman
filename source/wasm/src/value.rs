@@ -17,6 +17,7 @@ use {
         Deserialize,
         Serialize,
     },
+    serde_json::value::RawValue,
     std::str::FromStr,
     wasm_bindgen::JsValue,
     web_sys::{
@@ -30,7 +31,7 @@ pub(crate) static STR_FALSE: &str = "false";
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[serde(rename = "snake_case")]
-pub(crate) enum ValueType {
+pub enum ValueType {
     String,
     Bool,
     Number,
@@ -41,7 +42,7 @@ pub(crate) enum ValueType {
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[serde(rename = "snake_case")]
-pub(crate) struct Value {
+pub struct Value {
     pub(crate) type_: ValueType,
     pub(crate) string: String,
 }
@@ -179,4 +180,84 @@ pub(crate) fn validate_cell(cell: &Element, y: Y, v: &Value) {
         }
     }
     cell.class_list().toggle_with_force(CLASS_INVALID, !ok).unwrap();
+}
+
+/// This is an analog to `serde_json::Value` that stores all values as string, in
+/// order to keep various text representation properties (like number of decimal
+/// places in a number).
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ExportValue {
+    pub type_: ValueType,
+    pub string: String,
+}
+
+impl Serialize for ExportValue {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer {
+        match self.type_ {
+            ValueType::String => { },
+            ValueType::Bool => {
+                if self.string == STR_TRUE {
+                    return serializer.serialize_bool(true);
+                } else if self.string == STR_FALSE {
+                    return serializer.serialize_bool(false);
+                }
+            },
+            ValueType::Number => {
+                if let Ok(_) = self.string.parse::<f64>() {
+                    return serde_json::from_str::<&RawValue>(&self.string).unwrap().serialize(serializer);
+                }
+            },
+            ValueType::Json => {
+                if let Ok(j) = serde_json::from_str::<&serde_json::value::RawValue>(&self.string) {
+                    return j.serialize(serializer);
+                }
+            },
+            ValueType::Null => {
+                return serde_json::Value::Null.serialize(serializer);
+            },
+            ValueType::Missing => {
+                return serde_json::Value::Null.serialize(serializer);
+            },
+        }
+        return serializer.serialize_str(&self.string);
+    }
+}
+
+impl<'de> Deserialize<'de> for ExportValue {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de> {
+        let raw = <Box<RawValue>>::deserialize(deserializer)?;
+        let json = serde_json::from_str::<serde_json::Value>(raw.get()).map_err(|e| serde::de::Error::custom(e))?;
+        let value_type;
+        match json {
+            serde_json::Value::Null => {
+                value_type = ValueType::Null;
+            },
+            serde_json::Value::Bool(_) => {
+                value_type = ValueType::Bool;
+            },
+            serde_json::Value::Number(_) => {
+                value_type = ValueType::Number;
+            },
+            serde_json::Value::String(j) => {
+                return Ok(Self {
+                    type_: ValueType::String,
+                    string: j,
+                });
+            },
+            serde_json::Value::Array(_) => {
+                value_type = ValueType::Json;
+            },
+            serde_json::Value::Object(_) => {
+                value_type = ValueType::Json;
+            },
+        }
+        return Ok(Self {
+            type_: value_type,
+            string: raw.get().to_string(),
+        });
+    }
 }

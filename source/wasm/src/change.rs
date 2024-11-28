@@ -1,7 +1,7 @@
 use {
     crate::{
         obs::ObsBool,
-        unit::Coord2,
+        unit::XY,
         value::Value,
     },
     flowcontrol::shed,
@@ -45,7 +45,7 @@ impl ChangeState {
 
 #[derive(Clone)]
 pub(crate) struct ChangeCells {
-    pub(crate) cells: HashMap<Coord2, Value>,
+    pub(crate) cells: HashMap<XY, Value>,
 }
 
 #[derive(Clone)]
@@ -56,8 +56,8 @@ pub(crate) struct ChangeSpliceRowCol {
 
 #[derive(Clone)]
 pub(crate) struct ChangeSplice {
-    pub(crate) start: Coord2,
-    pub(crate) remove: Coord2,
+    pub(crate) start: XY,
+    pub(crate) remove: XY,
     /// Each element is a column, with entries for all rows not including added rows.
     /// i.e. This can't have more elements than there are rows remaining after removal
     /// (+1 for heading).
@@ -77,7 +77,7 @@ pub(crate) enum Change {
 
 #[derive(Clone)]
 pub(crate) struct ChangeLevel {
-    selection: Option<Coord2>,
+    selection: Option<XY>,
     changes: Vec<Change>,
 }
 
@@ -91,7 +91,7 @@ pub(crate) fn flush_undo(state: &ChangeState) {
     state.has_undo.set(true);
 }
 
-pub(crate) fn push_undo_no_merge(state: &ChangeState, sel: Option<Coord2>, change: Change) {
+pub(crate) fn push_undo_no_merge(state: &ChangeState, sel: Option<XY>, change: Change) {
     let mut current_undo_level = state.current_undo_level.borrow_mut();
     if current_undo_level.changes.is_empty() {
         current_undo_level.selection = sel;
@@ -102,7 +102,7 @@ pub(crate) fn push_undo_no_merge(state: &ChangeState, sel: Option<Coord2>, chang
     state.has_redo.set(false);
 }
 
-pub(crate) fn push_undo(state: &ChangeState, sel: Option<Coord2>, change: Change) {
+pub(crate) fn push_undo(state: &ChangeState, sel: Option<XY>, change: Change) {
     let now = Instant::now();
     if now.saturating_duration_since(state.last_change.get()) > Duration::from_millis(1000) {
         flush_undo(state);
@@ -132,11 +132,11 @@ pub(crate) fn push_undo(state: &ChangeState, sel: Option<Coord2>, change: Change
     push_undo_no_merge(state, sel, change);
 }
 
-pub(crate) fn act_undo(
+pub(crate) fn undo(
     state: &ChangeState,
-    current_selection: Option<Coord2>,
-    mut apply: impl FnMut(Change) -> (Option<Coord2>, Change),
-    select: impl FnOnce(Coord2),
+    current_selection: Option<XY>,
+    mut apply: impl FnMut(Change) -> (Option<XY>, Change),
+    select: impl FnOnce(XY),
 ) {
     flush_undo(state);
     let level = state.undo.borrow_mut().pop();
@@ -162,11 +162,11 @@ pub(crate) fn act_undo(
     }
 }
 
-pub(crate) fn act_redo(
+pub(crate) fn redo(
     state: &ChangeState,
-    current_selection: Option<Coord2>,
-    mut apply: impl FnMut(Change) -> (Option<Coord2>, Change),
-    select: impl FnOnce(Coord2),
+    current_selection: Option<XY>,
+    mut apply: impl FnMut(Change) -> (Option<XY>, Change),
+    select: impl FnOnce(XY),
 ) {
     flush_undo(state);
     let level = state.redo.borrow_mut().pop();

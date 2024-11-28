@@ -1,24 +1,30 @@
 div.sheetman {
-  --c-bg1: #333333;
-  --c-fg1: #aaaaaa;
-  --c-bg2: #f7f7f7;
-  --c-fg2: black;
-  --c-fg2-disabled: #737373;
-  --c-bg3: #ffffff;
+  --c-bg-superbg: #333333;
+  --c-fg-superbg: #aaaaaa;
+  --c-bg-main: #f7f7f7;
+  --c-fg-main: black;
+  --c-fg-main-disabled: #737373;
+  --c-bg-cell: #ffffff;
   --c-bg-pin-th: rgb(133, 133, 197);
   --c-bg-pin-cell: rgb(190, 190, 228);
   --c-grid: #c0c0c0;
-  --c-select: #8797c0;
-  --c-select-edit: #39c558;
+  --c-focused: #000000;
+  --c-focused-edit: #39c558;
   --c-fg-str: black;
   --c-fg-number: #193489;
   --c-fg-json: #6e1b87;
   --c-fg-bool: #b24a16;
   --c-bg-invalid: rgb(226, 166, 166);
+  --c-bg-marked: rgb(219, 227, 141);
+  --c-bg-submarked: color-mix(
+    in srgb,
+    rgb(164, 179, 147),
+    var(--c-bg-cell) 50%
+  );
   --s-radius: 0.05cm;
   --s-thin: 0.04cm;
   font-family: sans-serif;
-  background-color: var(--c-bg2);
+  background-color: var(--c-bg-main);
   display: flex;
   flex-direction: column;
   overflow-x: hidden;
@@ -45,7 +51,7 @@ div.sheetman {
     }
 
     & .toolbar_tabs {
-      background-color: var(--c-bg1);
+      background-color: var(--c-bg-superbg);
       display: flex;
       flex-direction: row;
       overflow-x: auto;
@@ -57,8 +63,8 @@ div.sheetman {
         padding-bottom: 0.3cm;
         padding-left: 0.4cm;
         padding-right: 0.4cm;
-        background-color: var(--c-bg1);
-        color: var(--c-fg1);
+        background-color: var(--c-bg-superbg);
+        color: var(--c-fg-superbg);
         min-width: max-content;
 
         &:before {
@@ -69,7 +75,7 @@ div.sheetman {
           position: absolute;
           bottom: 0.1cm;
           width: 0.5cm;
-          background-color: var(--c-bg2);
+          background-color: var(--c-bg-main);
           opacity: 0.5;
         }
 
@@ -78,10 +84,10 @@ div.sheetman {
         }
 
         &.toolbar_tab_button_front {
-          background-color: var(--c-bg2);
-          color: var(--c-fg2);
+          background-color: var(--c-bg-main);
+          color: var(--c-fg-main);
           &:before {
-            background-color: var(--c-bg1);
+            background-color: var(--c-bg-superbg);
             opacity: 1;
           }
         }
@@ -90,7 +96,7 @@ div.sheetman {
   }
 
   & .toolbar {
-    background-color: var(--c-bg2);
+    background-color: var(--c-bg-main);
     display: flex;
     flex-direction: row;
     overflow-x: auto;
@@ -105,7 +111,7 @@ div.sheetman {
       min-width: max-content;
 
       &.disabled {
-        color: var(--c-fg2-disabled);
+        color: var(--c-fg-main-disabled);
       }
 
       &:hover:before {
@@ -116,7 +122,7 @@ div.sheetman {
         right: var(--s-outerpad);
         top: var(--s-outerpad);
         bottom: var(--s-outerpad);
-        border: var(--s-thin) solid var(--c-bg1);
+        border: var(--s-thin) solid var(--c-bg-superbg);
         border-radius: var(--s-radius);
       }
     }
@@ -167,7 +173,7 @@ div.sheetman {
       outline: none;
     }
 
-    &.selected::before {
+    &.focused::before {
       display: inline-block;
       position: absolute;
       content: "";
@@ -175,12 +181,20 @@ div.sheetman {
       right: var(--s-outerpad);
       top: var(--s-outerpad);
       bottom: var(--s-outerpad);
-      border: var(--s-thin) solid var(--c-select);
+      border: var(--s-thin) solid var(--c-focused);
       border-radius: var(--s-radius);
     }
 
-    &.selected.editing::before {
-      border-color: var(--c-select-edit);
+    &.focused.editing::before {
+      border-style: dashed;
+    }
+
+    &.marked {
+      background-color: var(--c-bg-marked);
+    }
+
+    &.submarked {
+      background-color: var(--c-bg-submarked);
     }
 
     &.invalid {
@@ -193,11 +207,16 @@ div.sheetman {
       justify-items: center;
       align-items: center;
       content: "∅";
-      color: color-mix(in srgb, var(--c-bg1), var(--c-bg2) 50%);
+      color: color-mix(in srgb, var(--c-bg-superbg), var(--c-bg-main) 50%);
     }
 
-    &[sheetman_type="missing"] {
-      background-color: color-mix(in srgb, var(--c-bg1), var(--c-bg2) 40%);
+    &[sheetman_type="missing"]:after {
+      display: grid;
+      grid-template-rows: 1fr;
+      justify-items: center;
+      align-items: center;
+      content: "—";
+      color: color-mix(in srgb, var(--c-bg-superbg), var(--c-bg-main) 40%);
     }
 
     &[sheetman_type="str"] {
@@ -226,7 +245,7 @@ div.sheetman {
   & th {
     top: 0px;
     position: sticky;
-    background-color: var(--c-bg2);
+    background-color: var(--c-bg-main);
     z-index: 1;
 
     &.pin_col {
@@ -236,7 +255,7 @@ div.sheetman {
   }
 
   & td {
-    background-color: var(--c-bg3);
+    background-color: var(--c-bg-cell);
 
     &.pin_col,
     &.pin_row {

@@ -3,6 +3,8 @@
 
 use {
     aargvark::Aargvark,
+    indexmap::IndexMap,
+    serde_json::value::RawValue,
     std::{
         fs::read,
         io::ErrorKind,
@@ -36,7 +38,7 @@ fn main() -> Result<(), String> {
                 match args.file.extension().map(|x| x.as_bytes()) {
                     Some(b"jsv") => {
                         initial_data =
-                            serde_json::from_slice::<Vec<serde_json::Value>>(
+                            serde_json::from_slice::<Vec<IndexMap<String, Box<RawValue>>>>(
                                 &raw_data,
                             ).map_err(|e| format!("Failed to parse file json into expected structure: {}", e))?;
                     },
@@ -52,7 +54,7 @@ fn main() -> Result<(), String> {
             },
         };
         *tauri_lib::STATE.lock().unwrap() = Some(State {
-            filename: args.file,
+            file_path: args.file,
             initial_data: Some(Box::new(initial_data)),
         });
     }

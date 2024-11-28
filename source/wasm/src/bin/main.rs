@@ -1,12 +1,8 @@
 use {
     gloo::{
         events::EventListener,
-        utils::{
-            document,
-            window,
-        },
+        utils::document,
     },
-    js_sys::Object,
     rooting::{
         el,
         set_root,
@@ -18,6 +14,7 @@ use {
     wasm::{
         create_editor,
         dom::{
+            as_blob,
             ICON_CLIPBOARD,
             ICON_OPEN,
             ICON_SAVE,
@@ -26,22 +23,14 @@ use {
         EditorOptions,
         Hotkey,
     },
-    wasm_bindgen::{
-        JsCast,
-        JsValue,
-    },
+    wasm_bindgen::JsCast,
     web_sys::{
-        Blob,
-        BlobPropertyBag,
-        ClipboardItem,
         FileReader,
         HtmlElement,
         HtmlInputElement,
         Url,
     },
 };
-
-static MIME: &str = "text/plain";
 
 fn main() {
     console_error_panic_hook::set_once();
@@ -118,21 +107,7 @@ fn main() {
                         let document = document();
                         let body = document.body().unwrap();
                         let a = document.create_element("a").unwrap().dyn_into::<HtmlElement>().unwrap();
-                        let url =
-                            Url::create_object_url_with_blob(
-                                &Blob::new_with_str_sequence_and_options(
-                                    &JsValue::from(
-                                        vec![
-                                            JsValue::from(serde_json::to_string_pretty(&editor.get_data()).unwrap())
-                                        ],
-                                    ),
-                                    &{
-                                        let p = BlobPropertyBag::new();
-                                        p.set_type(MIME);
-                                        p
-                                    },
-                                ).unwrap(),
-                            ).unwrap();
+                        let url = Url::create_object_url_with_blob(&as_blob(editor.get_data())).unwrap();
                         a.set_attribute("href", &url).unwrap();
                         a.set_attribute("download", &filename.borrow()).unwrap();
                         body.append_child(&a).unwrap();
@@ -145,37 +120,18 @@ fn main() {
             EditorAction {
                 text: "Copy".to_string(),
                 icon: ICON_CLIPBOARD.to_string(),
-                hotkeys: vec![Hotkey {
-                    key: "c".to_string(),
-                    ctrl: true,
-                    alt: false,
-                }],
+                hotkeys: vec![],
                 cb: Rc::new(RefCell::new(Box::new(|editor| {
-                    _ = window().navigator().clipboard().write(&JsValue::from(vec![
-                        //. .
-                        ClipboardItem::new_with_record_from_str_to_str_promise(&Object::from_entries(&JsValue::from(vec![
-                            //. .
-                            JsValue::from(vec![
-                                //. .
-                                JsValue::from(MIME),
-                                JsValue::from(Blob::new_with_str_sequence_and_options(&JsValue::from(vec![
-                                    //. .
-                                    JsValue::from(serde_json::to_string_pretty(&editor.get_data()).unwrap())
-                                ]), &{
-                                    let p = BlobPropertyBag::new();
-                                    p.set_type(MIME);
-                                    p
-                                }).unwrap())
-                            ])
-                        ])).unwrap()).unwrap()
-                    ]));
+                    wasm::dom::copy(editor.get_data());
                 }))),
             }
         ],
         initial_data: vec![
-            serde_json::Value::Object(
-                [("".to_string(), serde_json::Value::String("".to_string()))].into_iter().collect(),
-            )
+            serde_json::from_value(
+                serde_json::Value::Object(
+                    [("".to_string(), serde_json::Value::String("".to_string()))].into_iter().collect(),
+                ),
+            ).unwrap()
         ],
     }).unwrap().root(), hidden]);
 }
