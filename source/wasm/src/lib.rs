@@ -12,7 +12,6 @@ use {
         ChangeState,
     },
     dom::{
-        copy,
         ATTR_CONTENTEDITABLE,
         ATTR_CONTENTEDITABLE_PLAINTEXT,
         ATTR_TABINDEX,
@@ -117,7 +116,6 @@ use {
         JsCast,
         JsValue,
     },
-    wasm_bindgen_futures::spawn_local,
     web_sys::{
         Element,
         FocusOptions,
@@ -163,6 +161,7 @@ struct State {
     pinned_rows: RefCell<BTreeSet<Y>>,
     mark: RefCell<Option<XY>>,
     hotkeys: HashMap<Hotkey, Rc<RefCell<Box<dyn FnMut(Editor)>>>>,
+    copied: RefCell<Option<Vec<Vec<Value>>>>,
 }
 
 fn update_cell_pin(state: &Rc<State>, cell: &Element, col: bool, row: bool) {
@@ -506,31 +505,26 @@ fn apply(state: &Rc<State>, change: Change) -> (Option<XY>, Change) {
             let new_selection;
             if let Some((old_x, old_y)) = old_selection {
                 let new_x;
-                if old_x < change.start.0 {
+                if old_x <= change.start.0 {
                     new_x = old_x;
+                } else if change.start.0 == initial_column_count {
+                    new_x = change.start.0 - X(1);
+                } else if old_x <= change.start.0 + change.remove.0 {
+                    new_x = change.start.0;
                 } else {
-                    if change.start.0 == initial_column_count {
-                        new_x = change.start.0 - X(1);
-                    } else {
-                        new_x = change.start.0;
-                    }
+                    new_x = old_x - change.remove.0;
                 }
                 let new_y;
                 if old_y < change.start.1 {
                     new_y = old_y;
+                } else if change.start.1 == initial_row_count {
+                    new_y = change.start.1 - Y(1);
+                } else if old_y <= change.start.1 + change.remove.1 {
+                    new_y = change.start.1;
                 } else {
-                    if change.start.1 == initial_row_count {
-                        new_y = change.start.1 - Y(1);
-                    } else {
-                        new_y = change.start.1;
-                    }
+                    new_y = old_y - change.remove.1;
                 }
-                let new_selection1 = (new_x, new_y);
-                if new_selection1 != (old_x, old_y) {
-                    new_selection = Some(new_selection1);
-                } else {
-                    new_selection = None;
-                }
+                new_selection = Some((new_x, new_y));
             } else {
                 new_selection = None;
             }
@@ -549,10 +543,7 @@ fn apply(state: &Rc<State>, change: Change) -> (Option<XY>, Change) {
 fn select(state: &Rc<State>, new_sel: XY) {
     let cell = get_cell(state, new_sel).unwrap().dyn_into::<HtmlElement>().unwrap();
     cell.focus().unwrap();
-    {
-        let mark = *state.mark.borrow();
-        sync_mark(state, Some(new_sel), mark);
-    }
+    sync_mark(state, Some(new_sel), *state.mark.borrow());
     register_select(state, &cell);
 }
 
@@ -889,8 +880,10 @@ fn act_sort(state: &Rc<State>, rev: bool) {
     }
     let mut change = ChangeCells { cells: HashMap::new() };
     for (row_idx, row) in value_rows.into_iter().enumerate() {
+        let y = Y(row_idx as i64 + 1);
         for (col_idx, cell) in row.into_iter().enumerate() {
-            change.cells.insert((X(row_idx as i64 + 1), Y(col_idx as i64)), cell);
+            let x = X(col_idx as i64);
+            change.cells.insert((x, y), cell);
         }
     }
     flush_undo(&state.change);
@@ -1179,13 +1172,20 @@ fn build_toolbar_row(state: &Rc<State>, button: &El, toolbar: &El) {
 }
 
 fn sync_mark(state: &Rc<State>, new_sel: Option<XY>, new_mark: Option<XY>) {
-    let old_marked = state.tbody.raw().get_elements_by_class_name(CLASS_MARKED);
-    for i in 0 .. old_marked.length() {
-        old_marked.item(i).unwrap().class_list().remove_1(CLASS_MARKED).unwrap();
+    {
+        let old_marked = state.tbody.raw().get_elements_by_class_name(CLASS_MARKED);
+        let old_marked = (0 .. old_marked.length()).map(|i| old_marked.item(i).unwrap()).collect::<Vec<_>>();
+        for e in old_marked {
+            e.class_list().remove_1(CLASS_MARKED).unwrap();
+        }
     }
-    let old_submarked = state.tbody.raw().get_elements_by_class_name(CLASS_SUBMARKED);
-    for i in 0 .. old_submarked.length() {
-        old_submarked.item(i).unwrap().class_list().remove_1(CLASS_SUBMARKED).unwrap();
+    {
+        let old_submarked = state.tbody.raw().get_elements_by_class_name(CLASS_SUBMARKED);
+        let old_submarked =
+            (0 .. old_submarked.length()).map(|i| old_submarked.item(i).unwrap()).collect::<Vec<_>>();
+        for e in old_submarked {
+            e.class_list().remove_1(CLASS_SUBMARKED).unwrap();
+        }
     }
     let rows = state.tbody.raw().children();
     match (new_sel, new_mark) {
@@ -1236,7 +1236,7 @@ fn act_copy(state: &Rc<State>) {
         }
         out_rows.push(out_row);
     }
-    copy(out_rows);
+    *state.copied.borrow_mut() = Some(out_rows);
 }
 
 fn act_cut(state: &Rc<State>) {
@@ -1256,7 +1256,7 @@ fn act_cut(state: &Rc<State>) {
         }
         out_rows.push(out_row);
     }
-    copy(out_rows);
+    *state.copied.borrow_mut() = Some(out_rows);
     flush_undo(&state.change);
     let (_, rev_change) = apply(state, Change::Cells(ChangeCells { cells: change_cells }));
     push_undo_no_merge(&state.change, Some(found.sel_xy), rev_change);
@@ -1267,31 +1267,30 @@ fn act_paste(state: &Rc<State>) {
     let Some((sel_xy, _)) = find_selection(state) else {
         return;
     };
-    let state = state.clone();
-    spawn_local(async move {
-        let text = wasm_bindgen_futures::JsFuture::from(window().navigator().clipboard().read_text()).await.unwrap();
-        let data_rows = serde_json::from_str::<Vec<Vec<Value>>>(&text.as_string().unwrap()).unwrap();
-        let mut change_cells = HashMap::new();
-        let w = table_width(&state);
-        let h = table_height(&state);
-        for (i, row) in data_rows.into_iter().enumerate() {
-            let y = Y(i as i64);
-            if y >= h {
+    let copied = state.copied.borrow();
+    let Some(data_rows) = copied.as_ref() else {
+        return;
+    };
+    let mut change_cells = HashMap::new();
+    let w = table_width(&state);
+    let h = table_height(&state);
+    for (i, row) in data_rows.into_iter().enumerate() {
+        let y = Y(i as i64);
+        if y >= h {
+            break;
+        }
+        for (j, value) in row.into_iter().enumerate() {
+            let x = X(j as i64);
+            if x >= w {
                 break;
             }
-            for (j, cell) in row.into_iter().enumerate() {
-                let x = X(j as i64);
-                if x >= w {
-                    break;
-                }
-                change_cells.insert((x, y), cell);
-            }
+            change_cells.insert((sel_xy.0 + x, sel_xy.1 + y), value.clone());
         }
-        flush_undo(&state.change);
-        let (_, rev_change) = apply(&state, Change::Cells(ChangeCells { cells: change_cells }));
-        push_undo_no_merge(&state.change, Some(sel_xy), rev_change);
-        flush_undo(&state.change);
-    });
+    }
+    flush_undo(&state.change);
+    let (_, rev_change) = apply(&state, Change::Cells(ChangeCells { cells: change_cells }));
+    push_undo_no_merge(&state.change, Some(sel_xy), rev_change);
+    flush_undo(&state.change);
 }
 
 fn act_fill(state: &Rc<State>) {
@@ -1383,6 +1382,141 @@ fn act_fill(state: &Rc<State>) {
     flush_undo(&state.change);
 }
 
+fn act_type_text(state: &Rc<State>) {
+    let Some(found) = find_marked(state) else {
+        return;
+    };
+    let mut change_cells = HashMap::new();
+    for row in found.marked {
+        for (xy, cell) in row {
+            if xy.1 == Y(0) {
+                continue;
+            }
+            let value = get_value(&cell);
+            let new_string;
+            shed!{
+                match value.type_ {
+                    ValueType::String => {
+                        return;
+                    },
+                    ValueType::Json => {
+                        if let Some(serde_json::Value::String(v)) = to_json(&value) {
+                            new_string = v;
+                            break;
+                        }
+                    },
+                    _ => { },
+                }
+                new_string = value.string;
+            };
+            change_cells.insert(xy, Value {
+                type_: ValueType::String,
+                string: new_string,
+            });
+        }
+    }
+    let (new_sel, rev_change) = apply(&state, Change::Cells(ChangeCells { cells: change_cells }));
+    if new_sel.is_some() {
+        panic!();
+    }
+    push_undo(&state.change, Some(found.sel_xy), rev_change);
+    update_value_obsbools(&state, &found.sel);
+}
+
+fn act_type_number(state: &Rc<State>) {
+    let Some(found) = find_marked(state) else {
+        return;
+    };
+    let mut change_cells = HashMap::new();
+    for row in found.marked {
+        for (xy, cell) in row {
+            if xy.1 == Y(0) {
+                return;
+            }
+            let value = get_value(&cell);
+            let new_string;
+            shed!{
+                match value.type_ {
+                    ValueType::Number => {
+                        return;
+                    },
+                    ValueType::String => {
+                        if value.string.parse::<f64>().is_ok() {
+                            new_string = value.string;
+                            break;
+                        }
+                    },
+                    ValueType::Json => {
+                        if let Some(serde_json::Value::Number(v)) = to_json(&value) {
+                            new_string = v.to_string();
+                            break;
+                        }
+                    },
+                    _ => { },
+                }
+                new_string = "".to_string();
+            };
+            change_cells.insert(xy, Value {
+                type_: ValueType::Number,
+                string: new_string,
+            });
+        }
+    }
+    let (new_sel, rev_change) = apply(&state, Change::Cells(ChangeCells { cells: change_cells }));
+    if new_sel.is_some() {
+        panic!();
+    }
+    push_undo(&state.change, Some(found.sel_xy), rev_change);
+    update_value_obsbools(&state, &found.sel);
+}
+
+fn act_type_bool(state: &Rc<State>) {
+    let Some(found) = find_marked(state) else {
+        return;
+    };
+    let mut change_cells = HashMap::new();
+    for row in found.marked {
+        for (xy, cell) in row {
+            if xy.1 == Y(0) {
+                return;
+            }
+            let value = get_value(&cell);
+            let new_string;
+            shed!{
+                match value.type_ {
+                    ValueType::String => {
+                        if value.string == STR_TRUE || value.string == STR_FALSE {
+                            new_string = value.string;
+                            break;
+                        }
+                    },
+                    ValueType::Bool => {
+                        return;
+                    },
+                    ValueType::Json => {
+                        if let Some(serde_json::Value::Bool(v)) = to_json(&value) {
+                            new_string = v.to_string();
+                            break;
+                        }
+                    },
+                    _ => { },
+                }
+                new_string = STR_FALSE.to_string();
+            };
+            change_cells.insert(xy, Value {
+                type_: ValueType::Bool,
+                string: new_string,
+            });
+        }
+    }
+    let (new_sel, rev_change) = apply(&state, Change::Cells(ChangeCells { cells: change_cells }));
+    if new_sel.is_some() {
+        panic!();
+    }
+    push_undo(&state.change, Some(found.sel_xy), rev_change);
+    update_value_obsbools(&state, &found.sel);
+}
+
 fn build_toolbar_cell(state: &Rc<State>, button: &El, toolbar: &El) {
     replace_toolbar_tab_front(&state, &button);
     toolbar.ref_clear();
@@ -1413,146 +1547,17 @@ fn build_toolbar_cell(state: &Rc<State>, button: &El, toolbar: &El) {
             let state = state.clone();
             move |_| act_fill(&state)
         }),
-        el_toolbar_button("String", ICON_TYPE_STRING, &state.focused_cell_not_str, {
+        el_toolbar_button("Text", ICON_TYPE_STRING, &state.focused_cell_not_str, {
             let state = state.clone();
-            move |_| {
-                let Some(found) = find_marked(&state) else {
-                    return;
-                };
-                let mut change_cells = HashMap::new();
-                for row in found.marked {
-                    for (xy, cell) in row {
-                        if xy.1 == Y(0) {
-                            continue;
-                        }
-                        let value = get_value(&cell);
-                        let new_string;
-                        shed!{
-                            match value.type_ {
-                                ValueType::String => {
-                                    return;
-                                },
-                                ValueType::Json => {
-                                    if let Some(serde_json::Value::String(v)) = to_json(&value) {
-                                        new_string = v;
-                                        break;
-                                    }
-                                },
-                                _ => { },
-                            }
-                            new_string = value.string;
-                        };
-                        change_cells.insert(xy, Value {
-                            type_: ValueType::String,
-                            string: new_string,
-                        });
-                    }
-                }
-                let (new_sel, rev_change) = apply(&state, Change::Cells(ChangeCells { cells: change_cells }));
-                if new_sel.is_some() {
-                    panic!();
-                }
-                push_undo(&state.change, Some(found.sel_xy), rev_change);
-                update_value_obsbools(&state, &found.sel);
-            }
+            move |_| act_type_text(&state)
         }),
         el_toolbar_button("Number", ICON_TYPE_NUMBER, &state.focused_cell_not_number, {
             let state = state.clone();
-            move |_| {
-                let Some(found) = find_marked(&state) else {
-                    return;
-                };
-                let mut change_cells = HashMap::new();
-                for row in found.marked {
-                    for (xy, cell) in row {
-                        if xy.1 == Y(0) {
-                            return;
-                        }
-                        let value = get_value(&cell);
-                        let new_string;
-                        shed!{
-                            match value.type_ {
-                                ValueType::Number => {
-                                    return;
-                                },
-                                ValueType::String => {
-                                    if value.string.parse::<f64>().is_ok() {
-                                        new_string = value.string;
-                                        break;
-                                    }
-                                },
-                                ValueType::Json => {
-                                    if let Some(serde_json::Value::Number(v)) = to_json(&value) {
-                                        new_string = v.to_string();
-                                        break;
-                                    }
-                                },
-                                _ => { },
-                            }
-                            new_string = "".to_string();
-                        };
-                        change_cells.insert(xy, Value {
-                            type_: ValueType::Number,
-                            string: new_string,
-                        });
-                    }
-                }
-                let (new_sel, rev_change) = apply(&state, Change::Cells(ChangeCells { cells: change_cells }));
-                if new_sel.is_some() {
-                    panic!();
-                }
-                push_undo(&state.change, Some(found.sel_xy), rev_change);
-                update_value_obsbools(&state, &found.sel);
-            }
+            move |_| act_type_number(&state)
         }),
         el_toolbar_button("Bool", ICON_TYPE_BOOL, &state.focused_cell_not_bool, {
             let state = state.clone();
-            move |_| {
-                let Some(found) = find_marked(&state) else {
-                    return;
-                };
-                let mut change_cells = HashMap::new();
-                for row in found.marked {
-                    for (xy, cell) in row {
-                        if xy.1 == Y(0) {
-                            return;
-                        }
-                        let value = get_value(&cell);
-                        let new_string;
-                        shed!{
-                            match value.type_ {
-                                ValueType::String => {
-                                    if value.string == STR_TRUE || value.string == STR_FALSE {
-                                        new_string = value.string;
-                                        break;
-                                    }
-                                },
-                                ValueType::Bool => {
-                                    return;
-                                },
-                                ValueType::Json => {
-                                    if let Some(serde_json::Value::Bool(v)) = to_json(&value) {
-                                        new_string = v.to_string();
-                                        break;
-                                    }
-                                },
-                                _ => { },
-                            }
-                            new_string = STR_FALSE.to_string();
-                        };
-                        change_cells.insert(xy, Value {
-                            type_: ValueType::Bool,
-                            string: new_string,
-                        });
-                    }
-                }
-                let (new_sel, rev_change) = apply(&state, Change::Cells(ChangeCells { cells: change_cells }));
-                if new_sel.is_some() {
-                    panic!();
-                }
-                push_undo(&state.change, Some(found.sel_xy), rev_change);
-                update_value_obsbools(&state, &found.sel);
-            }
+            move |_| act_type_bool(&state)
         }),
         el_toolbar_button("Json", ICON_TYPE_JSON, &state.focused_cell_not_json, {
             let state = state.clone();
@@ -1853,6 +1858,7 @@ pub fn create_editor(opts: EditorOptions) -> Result<Editor, String> {
             .iter()
             .flat_map(|a| a.hotkeys.iter().map(|k| (k.clone(), a.cb.clone())))
             .collect(),
+        copied: RefCell::new(None),
     });
     state.pin_resize_observer.get_or_init(|| {
         return ResizeObserver::new({
@@ -2050,22 +2056,16 @@ pub fn create_editor(opts: EditorOptions) -> Result<Editor, String> {
                             ev.prevent_default();
                         },
                         "x" => {
-                            if ev.ctrl_key() {
-                                act_cut(&state);
-                                ev.prevent_default();
-                            }
+                            act_cut(&state);
+                            ev.prevent_default();
                         },
                         "c" => {
-                            if ev.ctrl_key() {
-                                act_copy(&state);
-                                ev.prevent_default();
-                            }
+                            act_copy(&state);
+                            ev.prevent_default();
                         },
-                        "v" => {
-                            if ev.ctrl_key() {
-                                act_paste(&state);
-                                ev.prevent_default();
-                            }
+                        "v" | "p" => {
+                            act_paste(&state);
+                            ev.prevent_default();
                         },
                         "u" => {
                             if ev.shift_key() {
@@ -2086,6 +2086,30 @@ pub fn create_editor(opts: EditorOptions) -> Result<Editor, String> {
                                 act_redo(&state, Some(xy));
                                 ev.prevent_default();
                             }
+                        },
+                        "n" => {
+                            act_type_bool(&state);
+                            ev.prevent_default();
+                        },
+                        "b" => {
+                            act_type_bool(&state);
+                            ev.prevent_default();
+                        },
+                        "t" => {
+                            act_type_text(&state);
+                            ev.prevent_default();
+                        },
+                        "f" => {
+                            act_fill(&state);
+                            ev.prevent_default();
+                        },
+                        "s" => {
+                            act_sort(&state, false);
+                            ev.prevent_default();
+                        },
+                        "S" => {
+                            act_sort(&state, true);
+                            ev.prevent_default();
                         },
                         _ => { },
                     }

@@ -36,13 +36,41 @@ Generally speaking, all keyboard interaction (hotkeys, typing, navigation) requi
 
 Some of these may be desktop/website/embedded specific. If there's a button in the menu it should work.
 
-- `Arrow key/HJKL` - Select a different cell/header
+- `Enter` - Toggle editing/flip value on boolean
 
-- `Ctrl + arrow key/HJKL` - Create a new column/row in the specified direction of the current cell
+- `Esc` - Stop editing cell
+
+- `Arrow key/h/j/k/l` - Select a different cell/header
+
+- `Ctrl + arrow key/h/j/k/l` - Create a new column/row in the specified direction of the current cell
 
 - `Ctrl + o` - Open a file
 
 - `Ctrl + s` - Save the file with the current name
+
+- `Ctrl + z/u` - Undo
+
+- `Ctrl + y` - Redo
+
+- `m` - Move or create mark on focused cell, or if already marked unmark
+
+- `x` - Cut marked/focused cells
+
+- `c` - Copy marked/focused cells
+
+- `v/p` - Paste with top-left corner over focused cell
+
+- `n` - Set cell type to number
+
+- `t` - Set cell type to text (string)
+
+- `b` - Set cell type to bool
+
+- `s` - Sort rows by focused column
+
+- `S` - Sort rows by focused column (reverse)
+
+- `f` - Fill columns in marked range
 
 ## Cell types
 
