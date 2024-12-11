@@ -6,6 +6,7 @@ use {
     indexmap::IndexMap,
     serde_json::value::RawValue,
     std::{
+        env,
         fs::read,
         io::ErrorKind,
         os::unix::ffi::OsStrExt,
@@ -25,17 +26,22 @@ struct Args {
 fn main() -> Result<(), String> {
     {
         let args = aargvark::vark::<Args>();
+        let cwd = match env::var("OWD") {
+            Ok(p) => PathBuf::from(p),
+            Err(_) => env::current_dir().expect("No CWD"),
+        };
+        let file = cwd.join(args.file);
         let initial_data;
-        match read(&args.file) {
+        match read(&file) {
             Err(e) => {
                 if e.kind() == ErrorKind::NotFound {
                     initial_data = default_data();
                 } else {
-                    return Err(format!("Failed to read file [{}]: {}", args.file.to_string_lossy(), e));
+                    return Err(format!("Failed to read file [{}]: {}", file.to_string_lossy(), e));
                 }
             },
             Ok(raw_data) => {
-                match args.file.extension().map(|x| x.as_bytes()) {
+                match file.extension().map(|x| x.as_bytes()) {
                     Some(b"jsv") => {
                         initial_data =
                             serde_json::from_slice::<Vec<IndexMap<String, Box<RawValue>>>>(
@@ -46,7 +52,7 @@ fn main() -> Result<(), String> {
                         return Err(
                             format!(
                                 "Missing or unknown extension for specified filename {}",
-                                args.file.to_string_lossy()
+                                file.to_string_lossy()
                             ).into(),
                         );
                     },
@@ -54,7 +60,7 @@ fn main() -> Result<(), String> {
             },
         };
         *tauri_lib::STATE.lock().unwrap() = Some(State {
-            file_path: args.file,
+            file_path: file,
             initial_data: Some(Box::new(initial_data)),
         });
     }
