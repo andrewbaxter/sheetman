@@ -42,7 +42,7 @@ fn main() -> Result<(), String> {
             },
             Ok(raw_data) => {
                 match file.extension().map(|x| x.as_bytes()) {
-                    Some(b"jsv") => {
+                    Some(b"jsv")|Some(b"json") => {
                         initial_data =
                             serde_json::from_slice::<Vec<IndexMap<String, Box<RawValue>>>>(
                                 &raw_data,

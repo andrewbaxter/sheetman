@@ -64,7 +64,7 @@ async fn command_open(
     app_handle
         .dialog()
         .file()
-        .add_filter("JSV", &["jsv"])
+        .add_filter("JSV (JSON)", &["jsv", "json"])
         .pick_file(move |file_path| res_tx.send(file_path).unwrap());
     let Some(file_path) = res_rx.await.unwrap() else {
         return Ok(None);
@@ -74,7 +74,7 @@ async fn command_open(
     let raw_data =
         read(&file_path).map_err(|e| format!("Failed to read file [{}]: {}", file_path.to_string_lossy(), e))?;
     match file_path.extension().map(|x| x.as_bytes()) {
-        Some(b"jsv") => {
+        Some(b"jsv") | Some(b"json") => {
             rows =
                 serde_json::from_slice::<Vec<IndexMap<String, Box<RawValue>>>>(
                     &raw_data,
@@ -92,19 +92,21 @@ async fn command_open(
 
 #[tauri::command]
 fn command_take_initial_data() -> Vec<IndexMap<String, Box<RawValue>>> {
+    // I'm not sure why this `IndexMap` survives sending over ipc while the one in
+    // `save` didn't
     return *STATE.lock().unwrap().as_mut().unwrap().initial_data.take().unwrap();
 }
 
-fn save(filename: &PathBuf, data: Vec<IndexMap<String, Box<RawValue>>>) -> Result<(), String> {
+fn save(filename: &PathBuf, data: String) -> Result<(), String> {
     write(
         &filename,
-        serde_json::to_vec_pretty(&data).unwrap(),
+        data.into_bytes(),
     ).map_err(|e| format!("Error saving file at [{}]: {}", filename.to_string_lossy(), e))?;
     return Ok(());
 }
 
 #[tauri::command]
-fn command_save(data: Vec<IndexMap<String, Box<RawValue>>>) -> Result<(), String> {
+fn command_save(data: String) -> Result<(), String> {
     let state = STATE.lock().unwrap();
     let filename = &state.as_ref().unwrap().file_path;
     save(&filename, data)?;
@@ -112,10 +114,7 @@ fn command_save(data: Vec<IndexMap<String, Box<RawValue>>>) -> Result<(), String
 }
 
 #[tauri::command]
-fn command_save_as(
-    app_handle: tauri::AppHandle,
-    data: Vec<IndexMap<String, Box<RawValue>>>,
-) -> Result<(), String> {
+fn command_save_as(app_handle: tauri::AppHandle, data: String) -> Result<(), String> {
     app_handle.dialog().file().add_filter("JSV", &["jsv"]).save_file(move |file_path| {
         if let Some(file_path) = file_path {
             let file_path = file_path.into_path().unwrap();

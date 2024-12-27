@@ -65,6 +65,7 @@ use {
             EventListenerOptions,
             EventListenerPhase,
         },
+        timers::callback::Timeout,
         utils::{
             document,
             window,
@@ -165,9 +166,19 @@ struct State {
 }
 
 fn update_cell_pin(state: &Rc<State>, cell: &Element, col: bool, row: bool) {
+    let cell = cell.dyn_ref::<HtmlElement>().unwrap();
     let classes = cell.class_list();
     classes.toggle_with_force(CLASS_PIN_COL, col).unwrap();
     classes.toggle_with_force(CLASS_PIN_ROW, row).unwrap();
+    let style = cell.style();
+    if !col {
+        style.remove_property("left").unwrap();
+        style.remove_property("right").unwrap();
+    }
+    if !row {
+        style.remove_property("top").unwrap();
+        style.remove_property("bottom").unwrap();
+    }
     if col || row {
         let obs_opts = ResizeObserverOptions::new();
         obs_opts.set_box(ResizeObserverBoxOptions::BorderBox);
@@ -200,7 +211,7 @@ fn update_column_pin_offsets(state: &Rc<State>) {
         width: 0.,
         cells: vec![],
     });
-    let mut start_left = 0.;
+    let mut initial_left = 0.;
     let grid_border_thickness = 1.;
     for rel_y in 0 .. rows.length() {
         let row = rows.item(rel_y).unwrap().children();
@@ -208,19 +219,15 @@ fn update_column_pin_offsets(state: &Rc<State>) {
             let cell = row.item(x.0 as u32).unwrap().dyn_into::<HtmlElement>().unwrap();
             if rel_y == 0 {
                 pin_col.width = cell.get_bounding_client_rect().width();
-                if *x > X(0) {
-                    start_left += grid_border_thickness + pin_col.width;
-                }
+                initial_left += grid_border_thickness + pin_col.width;
             }
             pin_col.cells.push(cell);
         }
     }
     let mut prev_right = 0.;
-    let mut prev_left = start_left;
-    for (rel_x, pin_col) in pin_cols.into_iter().enumerate() {
-        if rel_x > 0 {
-            prev_left -= grid_border_thickness + pin_col.width;
-        }
+    let mut prev_left = initial_left;
+    for pin_col in pin_cols {
+        prev_left -= grid_border_thickness + pin_col.width;
         for cell in &pin_col.cells {
             cell.style().set_property("left", &format!("{}px", prev_right)).unwrap();
             cell.style().set_property("right", &format!("{}px", prev_left)).unwrap();
@@ -257,20 +264,15 @@ fn update_row_pin_offsets(state: &Rc<State>) {
             let cell = row.item(rel_x).unwrap().dyn_into::<HtmlElement>().unwrap();
             if rel_x == 0 {
                 pin_row.height = cell.get_bounding_client_rect().height();
-                if *y > Y(0) {
-                    sum_height += grid_border_thickness;
-                    sum_height += pin_row.height;
-                }
+                sum_height += grid_border_thickness + pin_row.height;
             }
             pin_row.cells.push(cell);
         }
     }
     let mut prev_bottom = 0.;
     let mut prev_top = sum_height;
-    for (rel_y, pin_row) in pin_rows.into_iter().enumerate() {
-        if rel_y > 0 {
-            prev_top -= grid_border_thickness + pin_row.height;
-        }
+    for pin_row in pin_rows {
+        prev_top -= grid_border_thickness + pin_row.height;
         for cell in &pin_row.cells {
             cell.style().set_property("top", &format!("{}px", prev_bottom)).unwrap();
             cell.style().set_property("bottom", &format!("{}px", prev_top)).unwrap();
@@ -775,6 +777,49 @@ fn act_redo(state: &Rc<State>, current_sel: Option<XY>) {
     redo(&state.change, current_sel, |c| apply(&state, c), |s| select(&state, s));
 }
 
+fn act_toggle_column_pin(state: &Rc<State>) {
+    let Some((sel_xy, _)) = find_selection(&state) else {
+        return;
+    };
+    let want_col_pinned = !state.pinned_cols.borrow().contains(&sel_xy.0);
+    if want_col_pinned {
+        state.pinned_cols.borrow_mut().insert(sel_xy.0);
+    } else {
+        state.pinned_cols.borrow_mut().remove(&sel_xy.0);
+    }
+    let rows = state.tbody.raw().children();
+    for rel_y in 0 .. rows.length() {
+        let row_pinned = state.pinned_rows.borrow().contains(&Y(rel_y as i64));
+        update_cell_pin(
+            &state,
+            &rows.item(rel_y).unwrap().children().item(sel_xy.0.0 as u32).unwrap(),
+            want_col_pinned,
+            row_pinned,
+        );
+    }
+    update_column_pin_offsets(&state);
+    state.focused_col_unpinned.set(!want_col_pinned);
+}
+
+fn act_toggle_row_pin(state: &Rc<State>) {
+    let Some((sel_xy, _)) = find_selection(&state) else {
+        return;
+    };
+    let want_row_pinned = !state.pinned_rows.borrow().contains(&sel_xy.1);
+    if want_row_pinned {
+        state.pinned_rows.borrow_mut().insert(sel_xy.1);
+    } else {
+        state.pinned_rows.borrow_mut().remove(&sel_xy.1);
+    }
+    let row = state.tbody.raw().children().item(sel_xy.1.0 as u32).unwrap().children();
+    for rel_x in 0 .. row.length() {
+        let col_pinned = state.pinned_cols.borrow().contains(&X(rel_x as i64));
+        update_cell_pin(&state, &row.item(rel_x).unwrap(), col_pinned, want_row_pinned);
+    }
+    update_row_pin_offsets(&state);
+    state.focused_row_unpinned.set(!want_row_pinned);
+}
+
 fn act_add_left(state: &Rc<State>) {
     let Some((sel_xy, _)) = find_selection(state) else {
         return;
@@ -959,29 +1004,7 @@ fn build_toolbar_column(state: &Rc<State>, button: &El, toolbar: &El) {
         //. .
         el_toolbar_button_2state([("Pin", ICON_PIN), ("Unpin", ICON_UNPIN)], &state.always, &state.focused_col_unpinned, {
             let state = state.clone();
-            move |_| {
-                let Some((sel_xy, _)) = find_selection(&state) else {
-                    return;
-                };
-                let want_col_pinned = !state.pinned_cols.borrow().contains(&sel_xy.0);
-                if want_col_pinned {
-                    state.pinned_cols.borrow_mut().insert(sel_xy.0);
-                } else {
-                    state.pinned_cols.borrow_mut().remove(&sel_xy.0);
-                }
-                let rows = state.tbody.raw().children();
-                for rel_y in 0 .. rows.length() {
-                    let row_pinned = state.pinned_rows.borrow().contains(&Y(rel_y as i64));
-                    update_cell_pin(
-                        &state,
-                        &rows.item(rel_y).unwrap().children().item(sel_xy.0.0 as u32).unwrap(),
-                        want_col_pinned,
-                        row_pinned,
-                    );
-                }
-                update_column_pin_offsets(&state);
-                state.focused_col_unpinned.set(!want_col_pinned);
-            }
+            move |_| act_toggle_column_pin(&state)
         }),
         el_toolbar_button("Add left", ICON_ADD_LEFT, &state.always, {
             let state = state.clone();
@@ -1042,24 +1065,7 @@ fn build_toolbar_row(state: &Rc<State>, button: &El, toolbar: &El) {
             &state.focused_row_unpinned,
             {
                 let state = state.clone();
-                move |_| {
-                    let Some((sel_xy, _)) = find_selection(&state) else {
-                        return;
-                    };
-                    let want_row_pinned = !state.pinned_rows.borrow().contains(&sel_xy.1);
-                    if want_row_pinned {
-                        state.pinned_rows.borrow_mut().insert(sel_xy.1);
-                    } else {
-                        state.pinned_rows.borrow_mut().remove(&sel_xy.1);
-                    }
-                    let row = state.tbody.raw().children().item(sel_xy.1.0 as u32).unwrap().children();
-                    for rel_x in 0 .. row.length() {
-                        let col_pinned = state.pinned_cols.borrow().contains(&X(rel_x as i64));
-                        update_cell_pin(&state, &row.item(rel_x).unwrap(), col_pinned, want_row_pinned);
-                    }
-                    update_row_pin_offsets(&state);
-                    state.focused_row_unpinned.set(!want_row_pinned);
-                }
+                move |_| act_toggle_row_pin(&state)
             },
         ),
         el_toolbar_button("Add above", ICON_ADD_UP, &state.focused_cell, {
@@ -1224,6 +1230,13 @@ fn act_mark(state: &Rc<State>) {
     });
 }
 
+fn act_unmark(state: &Rc<State>) {
+    let Some((sel_xy, _)) = find_selection(&state) else {
+        return;
+    };
+    set_mark(state, Some(sel_xy), None);
+}
+
 fn act_copy(state: &Rc<State>) {
     let Some(found) = find_marked(state) else {
         return;
@@ -1243,24 +1256,36 @@ fn act_cut(state: &Rc<State>) {
     let Some(found) = find_marked(state) else {
         return;
     };
-    let mut change_cells = HashMap::new();
     let mut out_rows = vec![];
     for row in found.marked {
         let mut out_row = vec![];
-        for (xy, cell) in row {
+        for (_, cell) in row {
             out_row.push(get_value(&cell));
-            change_cells.insert(xy, Value {
-                type_: ValueType::String,
-                string: "".to_string(),
-            });
         }
         out_rows.push(out_row);
     }
     *state.copied.borrow_mut() = Some(out_rows);
+    clear_cells(state);
+}
+
+fn clear_cells(state: &Rc<State>) {
+    let Some(found) = find_marked(state) else {
+        return;
+    };
+    let mut change_cells = HashMap::new();
+    for row in found.marked {
+        for (xy, _) in row {
+            change_cells.insert(xy, v_str(""));
+        }
+    }
     flush_undo(&state.change);
     let (_, rev_change) = apply(state, Change::Cells(ChangeCells { cells: change_cells }));
     push_undo_no_merge(&state.change, Some(found.sel_xy), rev_change);
     flush_undo(&state.change);
+}
+
+fn act_clear_cell(state: &Rc<State>) {
+    clear_cells(state);
 }
 
 fn act_paste(state: &Rc<State>) {
@@ -2055,16 +2080,34 @@ pub fn create_editor(opts: EditorOptions) -> Result<Editor, String> {
                             act_mark(&state);
                             ev.prevent_default();
                         },
+                        "M" => {
+                            act_unmark(&state);
+                            ev.prevent_default();
+                        },
                         "x" => {
                             act_cut(&state);
                             ev.prevent_default();
                         },
                         "c" => {
-                            act_copy(&state);
+                            if ev.ctrl_key() {
+                                act_copy(&state);
+                                ev.prevent_default();
+                            } else {
+                                act_toggle_column_pin(&state);
+                            }
+                        },
+                        "v" => {
+                            if ev.ctrl_key() {
+                                act_paste(&state);
+                                ev.prevent_default();
+                            }
+                        },
+                        "p" => {
+                            act_paste(&state);
                             ev.prevent_default();
                         },
-                        "v" | "p" => {
-                            act_paste(&state);
+                        "Delete" | "Backspace" => {
+                            act_clear_cell(&state);
                             ev.prevent_default();
                         },
                         "u" => {
@@ -2085,19 +2128,13 @@ pub fn create_editor(opts: EditorOptions) -> Result<Editor, String> {
                             if ev.ctrl_key() {
                                 act_redo(&state, Some(xy));
                                 ev.prevent_default();
+                            } else {
+                                act_copy(&state);
+                                ev.prevent_default();
                             }
                         },
-                        "n" => {
-                            act_type_bool(&state);
-                            ev.prevent_default();
-                        },
-                        "b" => {
-                            act_type_bool(&state);
-                            ev.prevent_default();
-                        },
-                        "t" => {
-                            act_type_text(&state);
-                            ev.prevent_default();
+                        "r" => {
+                            act_toggle_row_pin(&state);
                         },
                         "f" => {
                             act_fill(&state);
@@ -2159,6 +2196,19 @@ pub fn create_editor(opts: EditorOptions) -> Result<Editor, String> {
                 }
             });
         }
+    });
+    state.root.ref_own({
+        let state = state.clone();
+        move |_| Timeout::new(0, move || {
+            let Some((_, e)) = find_selection(&state) else {
+                return;
+            };
+            e.dyn_into::<HtmlElement>().unwrap().focus_with_options(&{
+                let o = FocusOptions::new();
+                o.set_prevent_scroll(true);
+                o
+            }).unwrap();
+        })
     });
     return Ok(Editor { state: state });
 }

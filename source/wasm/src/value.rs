@@ -13,6 +13,7 @@ use {
         },
         unit::Y,
     },
+    flowcontrol::shed,
     serde::{
         Deserialize,
         Serialize,
@@ -40,7 +41,7 @@ pub enum ValueType {
     Missing,
 }
 
-#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Hash)]
 #[serde(rename = "snake_case")]
 pub struct Value {
     pub(crate) type_: ValueType,
@@ -58,6 +59,47 @@ impl FromStr for Value {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         return serde_json::from_str(s).map_err(|e| e.to_string());
+    }
+}
+
+impl Ord for Value {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        match self.type_.cmp(&other.type_) {
+            std::cmp::Ordering::Equal => { },
+            o => return o,
+        }
+        shed!{
+            match &self.type_ {
+                ValueType::Bool => {
+                    return match self.string.as_str() {
+                        "true" => true,
+                        "false" => false,
+                        _ => break,
+                    }.cmp(&match other.string.as_str() {
+                        "true" => true,
+                        "false" => false,
+                        _ => break,
+                    });
+                },
+                ValueType::Number => {
+                    let Ok(self_num) = self.string.parse::<f64>() else {
+                        break;
+                    };
+                    let Ok(other_num) = other.string.parse::<f64>() else {
+                        break;
+                    };
+                    return self_num.total_cmp(&other_num);
+                },
+                _ => { },
+            }
+        }
+        return self.string.cmp(&other.string);
+    }
+}
+
+impl PartialOrd for Value {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        return Some(self.cmp(other));
     }
 }
 

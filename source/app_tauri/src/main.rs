@@ -71,7 +71,11 @@ fn main() {
                         spawn_local(async move {
                             invoke("command_save", JsValue::from(Object::from_entries(&JsValue::from(vec![
                                 //. .
-                                JsValue::from(vec![JsValue::from("data"), JsValue::from_serde(&editor.get_data()).unwrap()])
+                                JsValue::from(vec![JsValue::from("data"), JsValue::from(
+                                    // Convert to json here because if this gets turned into an intermediate js object
+                                    // via serde the ordering is lost
+                                    serde_json::to_string_pretty(&editor.get_data()).unwrap(),
+                                )])
                             ])).unwrap())).await;
                         });
                     }))),
@@ -84,7 +88,10 @@ fn main() {
                         spawn_local(async move {
                             invoke("command_save_as", JsValue::from(Object::from_entries(&JsValue::from(vec![
                                 //. .
-                                JsValue::from(vec![JsValue::from("data"), JsValue::from_serde(&editor.get_data()).unwrap()])
+                                JsValue::from(vec![JsValue::from("data"), JsValue::from(
+                                    // See note above
+                                    serde_json::to_string_pretty(&editor.get_data()).unwrap(),
+                                )])
                             ])).unwrap())).await;
                         });
                     }))),

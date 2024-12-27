@@ -51,7 +51,7 @@ fn main() {
                     let hidden = hidden.clone();
                     let filename = filename.clone();
                     move |editor| {
-                        let file_dialog_input = el("input").attr("type", "file").attr("accept", ".jsv");
+                        let file_dialog_input = el("input").attr("type", "file").attr("accept", ".jsv, .json");
                         file_dialog_input.ref_on("change", {
                             let filename = filename.clone();
                             let file_dialog_input = file_dialog_input.clone();

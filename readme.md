@@ -46,29 +46,29 @@ Some of these may be desktop/website/embedded specific. If there's a button in t
 
 - `Ctrl + o` - Open a file
 
+- `c` - Toggle pin on a column
+
+- `r` - Toggle pin on a row
+
 - `Ctrl + s` - Save the file with the current name
 
 - `Ctrl + z/u` - Undo
 
 - `Ctrl + y` - Redo
 
-- `m` - Move or create mark on focused cell, or if already marked unmark
+- `m` - Move or create mark on focused cell, or unmark if currently marked
 
-- `x` - Cut marked/focused cells
+- `Shift + m` - Unmark
 
-- `c` - Copy marked/focused cells
+- `x/Ctrl + x` - Cut marked/focused cells
 
-- `v/p` - Paste with top-left corner over focused cell
+- `c/Ctrl + c` - Copy marked/focused cells
 
-- `n` - Set cell type to number
-
-- `t` - Set cell type to text (string)
-
-- `b` - Set cell type to bool
+- `p/Ctrl + v` - Paste with top-left corner over focused cell
 
 - `s` - Sort rows by focused column
 
-- `S` - Sort rows by focused column (reverse)
+- `Shift + s` - Sort rows by focused column (reverse)
 
 - `f` - Fill columns in marked range
 
